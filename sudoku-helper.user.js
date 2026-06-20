@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.4.0
+// @version      0.5.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -27,6 +27,7 @@
   ];
   const LEGACY_KEYS = ["clearGrid", "userGrid", "puzzleGrid", "pencilGrid", "winRate", "timePassed", "cages"];
   const DIGITS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const SPEED_STORAGE_KEY = `${APP_ID}:autoFillSpeed`;
 
   if (window[API_NAME] && typeof window[API_NAME].destroy === "function") {
     window[API_NAME].destroy();
@@ -38,6 +39,8 @@
     panel: null,
     manualSection: null,
     manualInput: null,
+    speedInput: null,
+    speedLabel: null,
     summary: null,
     sourceLabel: null,
     list: null,
@@ -47,6 +50,7 @@
     manualMode: false,
     manualGrid: "",
     autoFilling: false,
+    autoFillSpeed: readStoredAutoFillSpeed(),
     notice: "",
     timer: 0,
     lastSignature: "",
@@ -71,8 +75,10 @@
       right: 18px;
       bottom: 18px;
       width: min(360px, calc(100vw - 36px));
-      max-height: min(580px, calc(100vh - 36px));
-      overflow: auto;
+      height: min(580px, calc(100vh - 36px));
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
       z-index: 2147483001;
       padding: 12px;
       border: 1px solid rgba(52, 72, 97, 0.18);
@@ -95,6 +101,7 @@
       margin-bottom: 8px;
       font-weight: 700;
       color: #243447;
+      flex: 0 0 auto;
     }
 
     .${APP_ID}-status {
@@ -107,11 +114,20 @@
       white-space: pre-wrap;
     }
 
+    .${APP_ID}-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      padding-right: 2px;
+      scrollbar-gutter: stable;
+    }
+
     .${APP_ID}-buttons {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px;
       margin-bottom: 8px;
+      flex: 0 0 auto;
     }
 
     .${APP_ID}-button {
@@ -134,6 +150,30 @@
       background: #325aaf;
       border-color: #325aaf;
       color: white;
+    }
+
+    .${APP_ID}-speed {
+      flex: 0 0 auto;
+      margin: 0 0 8px;
+      padding: 8px;
+      border-radius: 6px;
+      background: #f5f7fb;
+      color: #3d4f66;
+      font-size: 12px;
+    }
+
+    .${APP_ID}-speed label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .${APP_ID}-speed input {
+      width: 100%;
+      display: block;
+      accent-color: #325aaf;
     }
 
     .${APP_ID}-manual {
@@ -235,13 +275,22 @@
         <button class="${APP_ID}-button" data-action="clearManual">清手动</button>
         <button class="${APP_ID}-button" data-action="diagnose">诊断</button>
       </div>
-      <div class="${APP_ID}-status" data-role="source">正在读取棋盘...</div>
-      <div class="${APP_ID}-status">绿色：排除法后唯一数字。黄色：该数字唯一位置。</div>
-      <div class="${APP_ID}-manual" data-role="manual">
-        <textarea spellcheck="false" placeholder="粘贴 81 位盘面，0 或 . 表示空格；也可以粘贴 9 行。"></textarea>
+      <div class="${APP_ID}-speed">
+        <label for="${APP_ID}-speed-input">
+          <span>自动填写速度</span>
+          <span data-role="speedLabel"></span>
+        </label>
+        <input id="${APP_ID}-speed-input" data-role="speed" type="range" min="1" max="10" step="1" value="${state.autoFillSpeed}">
       </div>
-      <div class="${APP_ID}-status" data-role="summary"></div>
-      <ul class="${APP_ID}-hint-list" data-role="list"></ul>
+      <div class="${APP_ID}-body">
+        <div class="${APP_ID}-status" data-role="source">正在读取棋盘...</div>
+        <div class="${APP_ID}-status">绿色：排除法后唯一数字。黄色：该数字唯一位置。</div>
+        <div class="${APP_ID}-manual" data-role="manual">
+          <textarea spellcheck="false" placeholder="粘贴 81 位盘面，0 或 . 表示空格；也可以粘贴 9 行。"></textarea>
+        </div>
+        <div class="${APP_ID}-status" data-role="summary"></div>
+        <ul class="${APP_ID}-hint-list" data-role="list"></ul>
+      </div>
     `;
 
     panel.addEventListener("click", onPanelClick);
@@ -251,6 +300,8 @@
     state.panel = panel;
     state.manualSection = panel.querySelector("[data-role='manual']");
     state.manualInput = panel.querySelector("textarea");
+    state.speedInput = panel.querySelector("[data-role='speed']");
+    state.speedLabel = panel.querySelector("[data-role='speedLabel']");
     state.sourceLabel = panel.querySelector("[data-role='source']");
     state.summary = panel.querySelector("[data-role='summary']");
     state.list = panel.querySelector("[data-role='list']");
@@ -298,6 +349,13 @@
   }
 
   function onPanelInput(event) {
+    if (event.target === state.speedInput) {
+      state.autoFillSpeed = normalizeAutoFillSpeed(event.target.value);
+      writeStoredAutoFillSpeed(state.autoFillSpeed);
+      updateSpeedLabel();
+      return;
+    }
+
     if (event.target !== state.manualInput) return;
     state.manualGrid = event.target.value;
     state.manualMode = true;
@@ -316,6 +374,54 @@
     set("strong", state.strongOnly);
     set("manual", state.manualMode);
     set("autoFill", state.autoFilling);
+    updateSpeedLabel();
+  }
+
+  function updateSpeedLabel() {
+    if (state.speedInput && Number(state.speedInput.value) !== state.autoFillSpeed) {
+      state.speedInput.value = String(state.autoFillSpeed);
+    }
+    if (!state.speedLabel) return;
+
+    const delay = getAutoFillBaseDelay();
+    const label = state.autoFillSpeed <= 3 ? "慢" : state.autoFillSpeed >= 8 ? "快" : "中";
+    state.speedLabel.textContent = `${label} ${state.autoFillSpeed}/10，约 ${delay}ms`;
+  }
+
+  function normalizeAutoFillSpeed(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 4;
+    return Math.min(10, Math.max(1, Math.round(number)));
+  }
+
+  function readStoredAutoFillSpeed() {
+    try {
+      return normalizeAutoFillSpeed(window.localStorage.getItem(SPEED_STORAGE_KEY) || 4);
+    } catch (error) {
+      return 4;
+    }
+  }
+
+  function writeStoredAutoFillSpeed(value) {
+    try {
+      window.localStorage.setItem(SPEED_STORAGE_KEY, String(normalizeAutoFillSpeed(value)));
+    } catch (error) {
+      // Storage may be blocked; the in-memory speed still works.
+    }
+  }
+
+  function getAutoFillBaseDelay() {
+    const speed = normalizeAutoFillSpeed(state.autoFillSpeed);
+    return Math.round(1000 - speed * 75);
+  }
+
+  function getRandomAutoFillDelay() {
+    const base = getAutoFillBaseDelay();
+    return Math.round(base * (0.75 + Math.random() * 0.65));
+  }
+
+  function getRandomCellSelectDelay() {
+    return Math.round(55 + Math.random() * 85);
   }
 
   function scheduleRefresh() {
@@ -357,7 +463,7 @@
     if (state.autoFilling) return;
 
     state.autoFilling = true;
-    state.notice = "正在自动填写确定数字...";
+    state.notice = `正在自动填写确定数字... 速度 ${state.autoFillSpeed}/10，带随机间隔`;
     updateButtons();
     refresh(true);
 
@@ -396,7 +502,7 @@
       for (const entry of entries) {
         const ok = await fillCellThroughPage(board, entry.index, entry.digit);
         if (ok) filled += 1;
-        await sleep(90);
+        await sleep(getRandomAutoFillDelay());
       }
 
       state.notice = `已尝试自动填写 ${filled}/${entries.length} 格确定数字。`;
@@ -424,7 +530,7 @@
 
   async function fillCellThroughPage(board, index, digit) {
     const clickedCell = clickBoardCell(board, index);
-    await sleep(35);
+    await sleep(getRandomCellSelectDelay());
 
     const clickedDigit = clickDigitControl(digit);
     if (clickedDigit) return clickedCell;
