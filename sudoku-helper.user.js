@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.6
+// @version      0.6.7
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.6";
+  const SCRIPT_VERSION = "0.6.7";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -59,6 +59,7 @@
     noGridRetryTimer: 0,
     noGridRetryCount: 0,
     lastSignature: "",
+    lastGoodSource: null,
     lastResult: null,
     lastDiagnostics: null,
     webpackRequire: null,
@@ -493,12 +494,18 @@
   }
 
   function hardRefreshBoard() {
-    clearCapturedGames();
+    prepareBoardRescan();
     state.lastSignature = "";
-    state.notice = "已清除缓存，正在重新读取当前棋盘...";
+    state.notice = "正在重新读取当前棋盘...";
     refresh(true);
     window.setTimeout(() => refresh(true), 450);
     window.setTimeout(() => refresh(true), 1200);
+  }
+
+  function prepareBoardRescan() {
+    state.pageCandidates = [];
+    state.pageScanSignature = "";
+    state.noGridRetryCount = 0;
   }
 
   function clearCapturedGames() {
@@ -507,6 +514,7 @@
     state.pageScanSignature = "";
     state.activeBaseGrid = null;
     state.activeBaseCapturedAt = 0;
+    state.lastGoodSource = null;
     state.noGridRetryCount = 0;
   }
 
@@ -543,6 +551,7 @@
     }
 
     clearNoGridRetry();
+    rememberGoodSource(source);
 
     const result = analyzeGrid(source.grid);
     state.lastResult = result;
@@ -963,6 +972,9 @@
     const pageScript = readPageScriptGame();
     if (pageScript && pageScript.grid) return pageScript;
 
+    const lastGood = readLastGoodGame();
+    if (lastGood && lastGood.grid) return lastGood;
+
     const diagnostics = diagnose(false);
     return {
       grid: null,
@@ -972,6 +984,29 @@
         "请先等棋盘加载完成；新版会自动监听题目接口并扫描页面数据。",
         "也可以打开“手动盘面”粘贴 81 位盘面。",
         diagnostics && diagnostics.short ? `诊断: ${diagnostics.short}` : "",
+      ].filter(Boolean).join("\n"),
+    };
+  }
+
+  function rememberGoodSource(source) {
+    if (!source || !source.grid || source.source === "最后可用盘面") return;
+    state.lastGoodSource = {
+      grid: source.grid.slice(),
+      source: source.source,
+      detail: source.detail || "",
+      rememberedAt: Date.now(),
+    };
+  }
+
+  function readLastGoodGame() {
+    if (!state.lastGoodSource) return null;
+    return {
+      grid: state.lastGoodSource.grid.slice(),
+      source: "最后可用盘面",
+      detail: [
+        "当前刷新暂时没有读到新数据，先保留上次成功读取的盘面。",
+        state.lastGoodSource.source,
+        state.lastGoodSource.detail,
       ].filter(Boolean).join("\n"),
     };
   }
