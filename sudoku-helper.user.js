@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.3
+// @version      0.6.4
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.3";
+  const SCRIPT_VERSION = "0.6.4";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -46,6 +46,7 @@
     sourceLabel: null,
     list: null,
     visible: true,
+    panelCollapsed: false,
     showAllCandidates: true,
     strongOnly: false,
     manualMode: false,
@@ -93,6 +94,21 @@
 
     #${APP_ID}-panel * {
       box-sizing: border-box;
+    }
+
+    #${APP_ID}-panel[data-collapsed="true"] {
+      width: min(250px, calc(100vw - 36px));
+      height: auto;
+    }
+
+    #${APP_ID}-panel[data-collapsed="true"] .${APP_ID}-header {
+      margin-bottom: 0;
+    }
+
+    #${APP_ID}-panel[data-collapsed="true"] .${APP_ID}-buttons,
+    #${APP_ID}-panel[data-collapsed="true"] .${APP_ID}-speed,
+    #${APP_ID}-panel[data-collapsed="true"] .${APP_ID}-body {
+      display: none;
     }
 
     .${APP_ID}-header {
@@ -289,7 +305,7 @@
     panel.innerHTML = `
       <div class="${APP_ID}-header">
         <span class="${APP_ID}-title"><span>数独候选助手</span><span class="${APP_ID}-version">v${SCRIPT_VERSION}</span></span>
-        <button class="${APP_ID}-button" data-action="close" title="关闭">关闭</button>
+        <button class="${APP_ID}-button" data-action="togglePanel" title="收起面板">收起</button>
       </div>
       <div class="${APP_ID}-buttons">
         <button class="${APP_ID}-button" data-action="refresh">刷新</button>
@@ -340,6 +356,11 @@
 
     const action = button.dataset.action;
     if (action === "refresh") refresh(true);
+    if (action === "togglePanel") {
+      state.panelCollapsed = !state.panelCollapsed;
+      updateButtons();
+      return;
+    }
     if (action === "visible") {
       state.visible = !state.visible;
       updateButtons();
@@ -374,7 +395,6 @@
       else autoFillStrongHints();
     }
     if (action === "diagnose") diagnose(true);
-    if (action === "close") destroy();
   }
 
   function onPanelInput(event) {
@@ -394,6 +414,7 @@
 
   function updateButtons() {
     if (!state.panel) return;
+    state.panel.dataset.collapsed = String(state.panelCollapsed);
     const set = (action, active) => {
       const button = state.panel.querySelector(`[data-action="${action}"]`);
       if (button) button.dataset.active = String(active);
@@ -405,6 +426,11 @@
     set("autoFill", state.autoFilling);
     const autoFillButton = state.panel.querySelector('[data-action="autoFill"]');
     if (autoFillButton) autoFillButton.textContent = state.autoFilling ? "停止填写" : "自动填写";
+    const toggleButton = state.panel.querySelector('[data-action="togglePanel"]');
+    if (toggleButton) {
+      toggleButton.textContent = state.panelCollapsed ? "展开" : "收起";
+      toggleButton.title = state.panelCollapsed ? "展开面板" : "收起面板";
+    }
     updateSpeedLabel();
   }
 
