@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.5
+// @version      0.6.6
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.5";
+  const SCRIPT_VERSION = "0.6.6";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -65,6 +65,9 @@
     networkCandidates: [],
     pageCandidates: [],
     pageScanSignature: "",
+    activeBaseGrid: null,
+    activeBaseCapturedAt: 0,
+    lastLocationHref: window.location.href,
     networkHookInstalled: false,
   };
 
@@ -278,7 +281,7 @@
     state.timer = window.setInterval(() => refresh(false), 900);
 
     window[API_NAME] = {
-      refresh: () => refresh(true),
+      refresh: () => hardRefreshBoard(),
       destroy,
       setManualGrid(grid) {
         state.manualGrid = String(grid || "");
@@ -359,7 +362,7 @@
     if (!button) return;
 
     const action = button.dataset.action;
-    if (action === "refresh") refresh(true);
+    if (action === "refresh") hardRefreshBoard();
     if (action === "togglePanel") {
       state.panelCollapsed = !state.panelCollapsed;
       updateButtons();
@@ -489,7 +492,31 @@
     window.requestAnimationFrame(() => refresh(false));
   }
 
+  function hardRefreshBoard() {
+    clearCapturedGames();
+    state.lastSignature = "";
+    state.notice = "已清除缓存，正在重新读取当前棋盘...";
+    refresh(true);
+    window.setTimeout(() => refresh(true), 450);
+    window.setTimeout(() => refresh(true), 1200);
+  }
+
+  function clearCapturedGames() {
+    state.networkCandidates = [];
+    state.pageCandidates = [];
+    state.pageScanSignature = "";
+    state.activeBaseGrid = null;
+    state.activeBaseCapturedAt = 0;
+    state.noGridRetryCount = 0;
+  }
+
   function refresh(force) {
+    if (window.location.href !== state.lastLocationHref) {
+      state.lastLocationHref = window.location.href;
+      clearCapturedGames();
+      state.lastSignature = "";
+    }
+
     const board = findBoardElement();
     state.boardElement = board;
 
@@ -924,8 +951,11 @@
     const runtime = readWebpackGame();
     if (runtime && runtime.grid) return runtime;
 
+    const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
+    if (freshNetwork && freshNetwork.grid) return freshNetwork;
+
     const stored = readStoredGame();
-    if (stored && stored.grid) return stored;
+    if (stored && stored.grid && shouldUseStoredGrid(stored.grid)) return stored;
 
     const network = readNetworkGame();
     if (network && network.grid) return network;
@@ -1033,14 +1063,32 @@
 
     let added = false;
     const capturedAt = Date.now();
+    const capturedCandidates = [];
     for (const candidate of candidates) {
       const grid = gameToGrid(candidate.game);
       if (!grid) continue;
-      state.networkCandidates.unshift({ ...candidate, grid, capturedAt });
+      const captured = { ...candidate, grid, capturedAt };
+      capturedCandidates.push(captured);
+      state.networkCandidates.unshift(captured);
       added = true;
     }
 
     if (!added) return;
+
+    const bestCaptured = capturedCandidates
+      .slice()
+      .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
+    const latestSignature = bestCaptured?.grid.join("");
+    if (latestSignature) {
+      state.activeBaseGrid = normalizeGridString(bestCaptured.game.mission) || bestCaptured.grid.slice();
+      state.activeBaseCapturedAt = capturedAt;
+      state.networkCandidates = state.networkCandidates.filter((candidate) => (
+        candidate.grid.join("") === latestSignature || capturedAt - candidate.capturedAt < 2500
+      ));
+      state.pageCandidates = state.pageCandidates.filter((candidate) => candidate.grid.join("") === latestSignature);
+      state.pageScanSignature = "";
+      state.lastSignature = "";
+    }
 
     const seen = new Set();
     state.networkCandidates = state.networkCandidates.filter((candidate) => {
@@ -1055,13 +1103,16 @@
     }
   }
 
-  function readNetworkGame() {
+  function readNetworkGame(options = {}) {
     if (!state.networkCandidates.length) return null;
+    const maxAgeMs = options.maxAgeMs || 0;
+    const now = Date.now();
 
     const ranked = state.networkCandidates
+      .filter((item) => !maxAgeMs || now - item.capturedAt <= maxAgeMs)
       .map((item) => ({
         ...item,
-        score: scoreCandidate(item) + Math.max(0, 20 - Math.floor((Date.now() - item.capturedAt) / 30_000)),
+        score: scoreCandidate(item) + Math.max(0, 20 - Math.floor((now - item.capturedAt) / 30_000)),
       }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
@@ -1072,6 +1123,20 @@
       source: best.path,
       detail: best.game.id ? `题目 ID: ${best.game.id}` : "自动抓取 sudoku.com 题目接口",
     };
+  }
+
+  function shouldUseStoredGrid(grid) {
+    if (!state.activeBaseGrid || Date.now() - state.activeBaseCapturedAt > 10 * 60_000) return true;
+    return isGridCompatibleWithBase(grid, state.activeBaseGrid);
+  }
+
+  function isGridCompatibleWithBase(grid, baseGrid) {
+    if (!Array.isArray(grid) || !Array.isArray(baseGrid) || grid.length !== 81 || baseGrid.length !== 81) return true;
+    for (let index = 0; index < 81; index += 1) {
+      if (baseGrid[index] && grid[index] && grid[index] !== baseGrid[index]) return false;
+      if (baseGrid[index] && !grid[index]) return false;
+    }
+    return true;
   }
 
   function readPageScriptGame() {
