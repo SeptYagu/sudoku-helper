@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.3.0
+// @version      0.4.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -46,6 +46,8 @@
     strongOnly: false,
     manualMode: false,
     manualGrid: "",
+    autoFilling: false,
+    notice: "",
     timer: 0,
     lastSignature: "",
     lastResult: null,
@@ -202,6 +204,7 @@
       },
       getLastResult: () => state.lastResult,
       getCapturedGames: () => state.networkCandidates.slice(),
+      autoFill: () => autoFillStrongHints(),
       diagnose: () => diagnose(true),
     };
   }
@@ -227,11 +230,13 @@
         <button class="${APP_ID}-button" data-action="visible">提示层</button>
         <button class="${APP_ID}-button" data-action="all">候选数</button>
         <button class="${APP_ID}-button" data-action="strong">强提示</button>
+        <button class="${APP_ID}-button" data-action="autoFill">自动填写</button>
         <button class="${APP_ID}-button" data-action="manual">手动盘面</button>
         <button class="${APP_ID}-button" data-action="clearManual">清手动</button>
         <button class="${APP_ID}-button" data-action="diagnose">诊断</button>
       </div>
       <div class="${APP_ID}-status" data-role="source">正在读取棋盘...</div>
+      <div class="${APP_ID}-status">绿色：排除法后唯一数字。黄色：该数字唯一位置。</div>
       <div class="${APP_ID}-manual" data-role="manual">
         <textarea spellcheck="false" placeholder="粘贴 81 位盘面，0 或 . 表示空格；也可以粘贴 9 行。"></textarea>
       </div>
@@ -287,6 +292,7 @@
       updateButtons();
       refresh(true);
     }
+    if (action === "autoFill") autoFillStrongHints();
     if (action === "diagnose") diagnose(true);
     if (action === "close") destroy();
   }
@@ -309,6 +315,7 @@
     set("all", state.showAllCandidates);
     set("strong", state.strongOnly);
     set("manual", state.manualMode);
+    set("autoFill", state.autoFilling);
   }
 
   function scheduleRefresh() {
@@ -344,6 +351,261 @@
     state.lastResult = result;
     drawOverlay(source.grid, result);
     renderStatus(source, result);
+  }
+
+  async function autoFillStrongHints() {
+    if (state.autoFilling) return;
+
+    state.autoFilling = true;
+    state.notice = "正在自动填写确定数字...";
+    updateButtons();
+    refresh(true);
+
+    try {
+      const source = readGrid();
+      if (!source.grid) {
+        state.notice = "没有读到盘面，自动填写已取消。";
+        return;
+      }
+      if (state.manualMode || source.source === "手动盘面") {
+        state.notice = "当前是手动盘面，不能自动填写到网页。";
+        return;
+      }
+
+      const result = analyzeGrid(source.grid);
+      if (result.conflicts.size) {
+        state.notice = "盘面有冲突，自动填写已取消。";
+        return;
+      }
+
+      const entries = getAutoFillEntries(source.grid, result);
+      if (!entries.length) {
+        state.notice = "当前没有可自动填写的确定数字。";
+        return;
+      }
+
+      const board = findBoardElement();
+      if (!board) {
+        state.notice = "没有找到网页棋盘，自动填写已取消。";
+        return;
+      }
+
+      disableNoteModeIfPossible();
+
+      let filled = 0;
+      for (const entry of entries) {
+        const ok = await fillCellThroughPage(board, entry.index, entry.digit);
+        if (ok) filled += 1;
+        await sleep(90);
+      }
+
+      state.notice = `已尝试自动填写 ${filled}/${entries.length} 格确定数字。`;
+    } finally {
+      state.autoFilling = false;
+      updateButtons();
+      refresh(true);
+      window.setTimeout(() => refresh(true), 300);
+    }
+  }
+
+  function getAutoFillEntries(grid, result) {
+    const digitsByCell = new Map();
+    for (const hint of result.strongHints) {
+      if (grid[hint.index]) continue;
+      if (!digitsByCell.has(hint.index)) digitsByCell.set(hint.index, new Set());
+      digitsByCell.get(hint.index).add(hint.digit);
+    }
+
+    return Array.from(digitsByCell.entries())
+      .filter(([, digits]) => digits.size === 1)
+      .map(([index, digits]) => ({ index, digit: Array.from(digits)[0] }))
+      .sort((a, b) => a.index - b.index);
+  }
+
+  async function fillCellThroughPage(board, index, digit) {
+    const clickedCell = clickBoardCell(board, index);
+    await sleep(35);
+
+    const clickedDigit = clickDigitControl(digit);
+    if (clickedDigit) return clickedCell;
+
+    return clickedCell && dispatchKeyboardDigit(digit);
+  }
+
+  function clickBoardCell(board, index) {
+    const rect = board.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+
+    const row = Math.floor(index / 9);
+    const col = index % 9;
+    const x = rect.left + rect.width * (col + 0.5) / 9;
+    const y = rect.top + rect.height * (row + 0.5) / 9;
+    const target = document.elementFromPoint(x, y) || board;
+    dispatchPointerClick(target, x, y);
+    return true;
+  }
+
+  function clickDigitControl(digit) {
+    const control = findDigitControl(digit);
+    if (!control) return false;
+
+    const rect = control.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    dispatchPointerClick(control, x, y);
+    return true;
+  }
+
+  function findDigitControl(digit) {
+    const value = String(digit);
+    const selectors = [
+      "button",
+      "[role='button']",
+      "[tabindex]",
+      "[data-value]",
+      "[data-number]",
+      "[data-digit]",
+      "[data-key]",
+      ".number",
+      ".numbers *",
+      ".numpad *",
+      ".keyboard *",
+      ".game-controls *",
+    ].join(",");
+    const boardRect = (state.boardElement || findBoardElement())?.getBoundingClientRect();
+
+    return Array.from(document.querySelectorAll(selectors))
+      .filter((element) => !state.panel?.contains(element))
+      .filter((element) => isVisibleElement(element))
+      .filter((element) => !isInsideSquareBoard(element, boardRect))
+      .filter((element) => elementMatchesDigit(element, value))
+      .map((element) => ({ element, score: scoreControlElement(element, boardRect) }))
+      .sort((a, b) => b.score - a.score)[0]?.element || null;
+  }
+
+  function elementMatchesDigit(element, value) {
+    const text = (element.textContent || "").trim();
+    const attrs = ["data-value", "data-number", "data-digit", "data-key", "aria-label", "title"];
+    const attrMatches = attrs.some((name) => {
+      const attr = String(element.getAttribute(name) || "").trim();
+      return attr === value || new RegExp(`(^|\\D)${value}(\\D|$)`).test(attr);
+    });
+    return text === value || attrMatches;
+  }
+
+  function isInsideSquareBoard(element, boardRect) {
+    if (!boardRect) return false;
+    const boardLooksSquare = Math.abs(boardRect.width - boardRect.height) < Math.max(boardRect.width, boardRect.height) * 0.18;
+    if (!boardLooksSquare) return false;
+
+    const rect = element.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    return centerX >= boardRect.left && centerX <= boardRect.right && centerY >= boardRect.top && centerY <= boardRect.bottom;
+  }
+
+  function scoreControlElement(element, boardRect) {
+    const rect = element.getBoundingClientRect();
+    const label = `${element.className || ""} ${element.id || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
+    let score = 0;
+
+    if (/number|digit|numpad|keyboard|control|key/.test(label)) score += 20;
+    if (element.tagName === "BUTTON" || element.getAttribute("role") === "button") score += 8;
+    if (!boardRect) return score;
+
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const boardCenterX = boardRect.left + boardRect.width / 2;
+    const boardCenterY = boardRect.top + boardRect.height / 2;
+    const distance = Math.hypot(centerX - boardCenterX, centerY - boardCenterY);
+
+    if (rect.top >= boardRect.top - 20 && rect.top <= boardRect.bottom + 260) score += 15;
+    if (centerX >= boardRect.left - 80 && centerX <= boardRect.right + 80) score += 8;
+    return score - distance / 100;
+  }
+
+  function dispatchKeyboardDigit(digit) {
+    const key = String(digit);
+    const keyCode = 48 + Number(digit);
+    const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body;
+
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      const event = new KeyboardEvent(type, {
+        key,
+        code: `Digit${digit}`,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+      try {
+        Object.defineProperty(event, "keyCode", { get: () => keyCode });
+        Object.defineProperty(event, "which", { get: () => keyCode });
+      } catch (error) {
+        // Some browsers keep keyboard legacy fields read-only.
+      }
+      target.dispatchEvent(event);
+    }
+
+    return true;
+  }
+
+  function disableNoteModeIfPossible() {
+    const control = findTextControl(["备注", "笔记", "Notes", "Note"]);
+    if (!control || !looksActive(control)) return false;
+
+    const rect = control.getBoundingClientRect();
+    dispatchPointerClick(control, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return true;
+  }
+
+  function findTextControl(labels) {
+    const normalized = labels.map((label) => label.toLowerCase());
+    return Array.from(document.querySelectorAll("button,[role='button'],[tabindex],.game-controls *"))
+      .filter((element) => !state.panel?.contains(element))
+      .filter((element) => isVisibleElement(element))
+      .filter((element) => {
+        const text = (element.textContent || element.getAttribute("aria-label") || element.getAttribute("title") || "").trim().toLowerCase();
+        return normalized.some((label) => text === label || text.includes(label));
+      })[0] || null;
+  }
+
+  function looksActive(element) {
+    const value = `${element.className || ""} ${element.getAttribute("aria-pressed") || ""} ${element.getAttribute("data-active") || ""}`.toLowerCase();
+    return /active|selected|true|on/.test(value);
+  }
+
+  function dispatchPointerClick(element, x, y) {
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      screenX: window.screenX + x,
+      screenY: window.screenY + y,
+      button: 0,
+      buttons: 1,
+    };
+
+    if (typeof PointerEvent === "function") {
+      element.dispatchEvent(new PointerEvent("pointerdown", { ...base, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      element.dispatchEvent(new PointerEvent("pointerup", { ...base, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
+    }
+
+    element.dispatchEvent(new MouseEvent("mousedown", base));
+    element.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+    element.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
+  }
+
+  function isVisibleElement(element) {
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.width >= 8 && rect.height >= 8 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function findBoardElement() {
@@ -1085,18 +1347,25 @@
     const isNaked = hints.some((hint) => hint.type === "唯一候选");
     const color = isNaked ? "rgba(31, 152, 93, 0.2)" : "rgba(255, 181, 71, 0.25)";
     const textColor = isNaked ? "#127348" : "#9a5b00";
+    const centerX = x + cellW / 2;
+    const centerY = y + cellH / 2;
+    const radius = Math.max(8, Math.min(cellW, cellH) / 2 - 4);
 
     ctx.save();
     ctx.fillStyle = color;
-    ctx.fillRect(x + 2, y + 2, cellW - 4, cellH - 4);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+    ctx.fill();
     ctx.strokeStyle = isNaked ? "rgba(31, 152, 93, 0.8)" : "rgba(255, 181, 71, 0.95)";
     ctx.lineWidth = 2;
-    ctx.strokeRect(x + 3, y + 3, cellW - 6, cellH - 6);
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, Math.max(6, radius - 1), 0, Math.PI * 2);
+    ctx.stroke();
     ctx.fillStyle = textColor;
     ctx.font = `700 ${Math.max(20, Math.floor(cellH * 0.48))}px system-ui, sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(digits.join("/"), x + cellW / 2, y + cellH / 2);
+    ctx.fillText(digits.join("/"), centerX, centerY);
     ctx.restore();
   }
 
@@ -1128,18 +1397,20 @@
     if (!state.summary || !state.list) return;
 
     if (!source.grid || !result) {
-      state.summary.textContent = "还没有可分析的盘面。";
+      state.summary.textContent = ["还没有可分析的盘面。", state.notice].filter(Boolean).join("\n");
       state.list.innerHTML = "";
       return;
     }
 
     const strongCount = result.strongHints.length;
     const conflictCount = result.conflicts.size;
-    state.summary.textContent = [
+    const summaryLines = [
       `已填 ${result.filled} 格，空 ${result.empty} 格`,
       `确定提示 ${strongCount} 个${conflictCount ? `，冲突 ${conflictCount} 格` : ""}`,
       state.strongOnly ? "当前只显示强提示。" : "当前显示候选数和强提示。",
-    ].join("\n");
+    ];
+    if (state.notice) summaryLines.push(state.notice);
+    state.summary.textContent = summaryLines.join("\n");
 
     const rows = result.strongHints.slice(0, 18).map((hint) => {
       const { row, col } = rowCol(hint.index);
