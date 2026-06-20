@@ -4,8 +4,8 @@
 // @version      0.2.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
-// @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-candidate-helper/main/sudoku-helper.user.js
-// @downloadURL  https://raw.githubusercontent.com/SeptYagu/sudoku-candidate-helper/main/sudoku-helper.user.js
+// @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js
+// @downloadURL  https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
