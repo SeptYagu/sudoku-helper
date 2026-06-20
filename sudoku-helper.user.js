@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.7
+// @version      0.7.8
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.7";
+  const SCRIPT_VERSION = "0.7.8";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -57,6 +57,7 @@
     manualGrid: "",
     autoFilling: false,
     autoFillCancelRequested: false,
+    autoFillCancelReason: "",
     autoFillSpeed: readStoredAutoFillSpeed(),
     notice: "",
     timer: 0,
@@ -561,7 +562,12 @@
   }
 
   function scheduleBoardRescan(notice, options = {}) {
+    let nextNotice = notice;
     if (options.markStale) {
+      if (state.autoFilling) {
+        cancelAutoFillForBoardSwitch();
+        nextNotice = "检测到难度/新局切换，正在停止自动填写并读取新盘面...";
+      }
       rememberStaleGridsForRescan();
       const context = options.context || getCurrentGameContext();
       state.expectedDifficulty = context.difficulty || "";
@@ -576,7 +582,7 @@
     resetBoardReadState(options);
     state.boardRescanStartedAt = Date.now();
     state.lastSignature = "";
-    state.notice = notice;
+    state.notice = nextNotice;
 
     clearBoardRescanTimers();
     state.boardRescanTimers = [0, 120, 350, 800, 1400, 2400, 4200, 6500].map((delay) => (
@@ -720,6 +726,7 @@
 
     state.autoFilling = true;
     state.autoFillCancelRequested = false;
+    state.autoFillCancelReason = "";
     state.notice = `正在自动填写确定数字... 速度 ${state.autoFillSpeed}/10，带随机间隔`;
     updateButtons();
     refresh(true);
@@ -731,7 +738,7 @@
       let stoppedReason = "";
       for (let step = 0; step < 81; step += 1) {
         if (state.autoFillCancelRequested) {
-          stoppedReason = "已手动停止";
+          stoppedReason = getAutoFillCancelReason();
           break;
         }
 
@@ -766,7 +773,7 @@
 
         const ok = await fillCellThroughPage(board, entry.index, entry.digit);
         if (state.autoFillCancelRequested) {
-          stoppedReason = "已手动停止";
+          stoppedReason = getAutoFillCancelReason();
           break;
         }
         if (!ok) {
@@ -774,13 +781,13 @@
           break;
         }
         if (!(await sleepWithAutoFillCancel(getRandomAutoFillDelay()))) {
-          stoppedReason = "已手动停止";
+          stoppedReason = getAutoFillCancelReason();
           break;
         }
 
         const confirmed = await waitForCellValue(entry.index, entry.digit, 1400);
         if (state.autoFillCancelRequested) {
-          stoppedReason = "已手动停止";
+          stoppedReason = getAutoFillCancelReason();
           break;
         }
         if (!confirmed) {
@@ -795,6 +802,7 @@
     } finally {
       state.autoFilling = false;
       state.autoFillCancelRequested = false;
+      state.autoFillCancelReason = "";
       updateButtons();
       refresh(true);
       window.setTimeout(() => refresh(true), 300);
@@ -804,9 +812,21 @@
   function requestAutoFillStop() {
     if (!state.autoFilling) return;
     state.autoFillCancelRequested = true;
+    state.autoFillCancelReason = "已手动停止";
     state.notice = "正在停止自动填写...";
     updateButtons();
     refresh(true);
+  }
+
+  function cancelAutoFillForBoardSwitch() {
+    if (!state.autoFilling) return;
+    state.autoFillCancelRequested = true;
+    state.autoFillCancelReason = "切换局面，已停止自动填写";
+    updateButtons();
+  }
+
+  function getAutoFillCancelReason() {
+    return state.autoFillCancelReason || "已停止";
   }
 
   function getAutoFillEntries(grid, result) {
