@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.2
+// @version      0.7.3
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.2";
+  const SCRIPT_VERSION = "0.7.3";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -566,15 +566,15 @@
 
   function finishBoardRescan() {
     clearBoardRescanTimers();
-    state.boardRescanStartedAt = 0;
-    state.staleGridSignatures.clear();
   }
 
   function isBoardRescanActive() {
-    return Boolean(
-      state.boardRescanStartedAt &&
-      Date.now() - state.boardRescanStartedAt <= BOARD_RESCAN_STALE_MS
-    );
+    if (!state.boardRescanStartedAt) return false;
+    if (Date.now() - state.boardRescanStartedAt <= BOARD_RESCAN_STALE_MS) return true;
+
+    state.boardRescanStartedAt = 0;
+    state.staleGridSignatures.clear();
+    return false;
   }
 
   function hardRefreshBoard() {
@@ -1313,6 +1313,9 @@
     for (const candidate of candidates) {
       const grid = gameToGrid(candidate.game);
       if (!grid) continue;
+      if (isStaleGrid(grid)) continue;
+      if (hasFreshActiveBase() && !gridMatchesBaseGrid(grid, state.activeBaseGrid)) continue;
+
       const captured = { ...candidate, grid, capturedAt };
       capturedCandidates.push(captured);
       state.networkCandidates.unshift(captured);
