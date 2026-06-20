@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.0
+// @version      0.6.1
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -478,44 +478,57 @@
     refresh(true);
 
     try {
-      const source = readGrid();
-      if (!source.grid) {
-        state.notice = "没有读到盘面，自动填写已取消。";
-        return;
-      }
-      if (state.manualMode || source.source === "手动盘面") {
-        state.notice = "当前是手动盘面，不能自动填写到网页。";
-        return;
-      }
-
-      const result = analyzeGrid(source.grid);
-      if (result.conflicts.size) {
-        state.notice = "盘面有冲突，自动填写已取消。";
-        return;
-      }
-
-      const entries = getAutoFillEntries(source.grid, result);
-      if (!entries.length) {
-        state.notice = "当前没有可自动填写的确定数字。";
-        return;
-      }
-
-      const board = findBoardElement();
-      if (!board) {
-        state.notice = "没有找到网页棋盘，自动填写已取消。";
-        return;
-      }
-
       disableNoteModeIfPossible();
 
       let filled = 0;
-      for (const entry of entries) {
+      let stoppedReason = "";
+      for (let step = 0; step < 81; step += 1) {
+        const source = readGrid();
+        if (!source.grid) {
+          stoppedReason = "没有读到盘面";
+          break;
+        }
+        if (state.manualMode || source.source === "手动盘面") {
+          stoppedReason = "当前是手动盘面，不能自动填写到网页";
+          break;
+        }
+
+        const result = analyzeGrid(source.grid);
+        if (result.conflicts.size) {
+          stoppedReason = "盘面有冲突";
+          break;
+        }
+
+        const entries = getAutoFillEntries(source.grid, result);
+        if (!entries.length) break;
+
+        const board = findBoardElement();
+        if (!board) {
+          stoppedReason = "没有找到网页棋盘";
+          break;
+        }
+
+        const entry = entries[0];
+        state.notice = `正在自动填写第 ${filled + 1} 格：${cellList([entry.index])} = ${entry.digit}`;
+        refresh(true);
+
         const ok = await fillCellThroughPage(board, entry.index, entry.digit);
-        if (ok) filled += 1;
+        if (!ok) {
+          stoppedReason = `${cellList([entry.index])} 点击失败`;
+          break;
+        }
         await sleep(getRandomAutoFillDelay());
+
+        const confirmed = await waitForCellValue(entry.index, entry.digit, 1400);
+        if (!confirmed) {
+          stoppedReason = `${cellList([entry.index])} 没确认填入 ${entry.digit}，已暂停避免继续误填`;
+          break;
+        }
+
+        filled += 1;
       }
 
-      state.notice = `已尝试自动填写 ${filled}/${entries.length} 格确定数字。`;
+      state.notice = stoppedReason ? `已自动填写 ${filled} 格；${stoppedReason}。` : `已自动填写 ${filled} 格确定数字。`;
     } finally {
       state.autoFilling = false;
       updateButtons();
@@ -546,6 +559,16 @@
     if (clickedDigit) return clickedCell;
 
     return clickedCell && dispatchKeyboardDigit(digit);
+  }
+
+  async function waitForCellValue(index, digit, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const source = readGrid();
+      if (source.grid && source.grid[index] === digit) return true;
+      await sleep(120);
+    }
+    return false;
   }
 
   function clickBoardCell(board, index) {
@@ -1512,7 +1535,10 @@
     for (const unit of units()) {
       for (const size of [2, 3]) {
         for (const digits of combinations(DIGITS, size)) {
-          const places = unit.cells.filter((index) => !grid[index] && digits.some((digit) => candidates[index].includes(digit)));
+          const digitPlaces = digits.map((digit) => unit.cells.filter((index) => !grid[index] && candidates[index].includes(digit)));
+          if (digitPlaces.some((places) => places.length === 0 || places.length > size)) continue;
+
+          const places = [...new Set(digitPlaces.flat())].sort((a, b) => a - b);
           if (places.length !== size) continue;
 
           const removable = places.some((index) => candidates[index].some((digit) => !digits.includes(digit)));
