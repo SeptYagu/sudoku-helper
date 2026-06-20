@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.1
+// @version      0.6.2
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -50,6 +50,7 @@
     manualMode: false,
     manualGrid: "",
     autoFilling: false,
+    autoFillCancelRequested: false,
     autoFillSpeed: readStoredAutoFillSpeed(),
     notice: "",
     timer: 0,
@@ -255,6 +256,7 @@
       getLastResult: () => state.lastResult,
       getCapturedGames: () => state.networkCandidates.slice(),
       autoFill: () => autoFillStrongHints(),
+      stopAutoFill: () => requestAutoFillStop(),
       diagnose: () => diagnose(true),
     };
   }
@@ -353,7 +355,10 @@
       updateButtons();
       refresh(true);
     }
-    if (action === "autoFill") autoFillStrongHints();
+    if (action === "autoFill") {
+      if (state.autoFilling) requestAutoFillStop();
+      else autoFillStrongHints();
+    }
     if (action === "diagnose") diagnose(true);
     if (action === "close") destroy();
   }
@@ -384,6 +389,8 @@
     set("strong", state.strongOnly);
     set("manual", state.manualMode);
     set("autoFill", state.autoFilling);
+    const autoFillButton = state.panel.querySelector('[data-action="autoFill"]');
+    if (autoFillButton) autoFillButton.textContent = state.autoFilling ? "停止填写" : "自动填写";
     updateSpeedLabel();
   }
 
@@ -470,9 +477,13 @@
   }
 
   async function autoFillStrongHints() {
-    if (state.autoFilling) return;
+    if (state.autoFilling) {
+      requestAutoFillStop();
+      return;
+    }
 
     state.autoFilling = true;
+    state.autoFillCancelRequested = false;
     state.notice = `正在自动填写确定数字... 速度 ${state.autoFillSpeed}/10，带随机间隔`;
     updateButtons();
     refresh(true);
@@ -483,6 +494,11 @@
       let filled = 0;
       let stoppedReason = "";
       for (let step = 0; step < 81; step += 1) {
+        if (state.autoFillCancelRequested) {
+          stoppedReason = "已手动停止";
+          break;
+        }
+
         const source = readGrid();
         if (!source.grid) {
           stoppedReason = "没有读到盘面";
@@ -513,13 +529,24 @@
         refresh(true);
 
         const ok = await fillCellThroughPage(board, entry.index, entry.digit);
+        if (state.autoFillCancelRequested) {
+          stoppedReason = "已手动停止";
+          break;
+        }
         if (!ok) {
           stoppedReason = `${cellList([entry.index])} 点击失败`;
           break;
         }
-        await sleep(getRandomAutoFillDelay());
+        if (!(await sleepWithAutoFillCancel(getRandomAutoFillDelay()))) {
+          stoppedReason = "已手动停止";
+          break;
+        }
 
         const confirmed = await waitForCellValue(entry.index, entry.digit, 1400);
+        if (state.autoFillCancelRequested) {
+          stoppedReason = "已手动停止";
+          break;
+        }
         if (!confirmed) {
           stoppedReason = `${cellList([entry.index])} 没确认填入 ${entry.digit}，已暂停避免继续误填`;
           break;
@@ -531,10 +558,19 @@
       state.notice = stoppedReason ? `已自动填写 ${filled} 格；${stoppedReason}。` : `已自动填写 ${filled} 格确定数字。`;
     } finally {
       state.autoFilling = false;
+      state.autoFillCancelRequested = false;
       updateButtons();
       refresh(true);
       window.setTimeout(() => refresh(true), 300);
     }
+  }
+
+  function requestAutoFillStop() {
+    if (!state.autoFilling) return;
+    state.autoFillCancelRequested = true;
+    state.notice = "正在停止自动填写...";
+    updateButtons();
+    refresh(true);
   }
 
   function getAutoFillEntries(grid, result) {
@@ -553,7 +589,7 @@
 
   async function fillCellThroughPage(board, index, digit) {
     const clickedCell = clickBoardCell(board, index);
-    await sleep(getRandomCellSelectDelay());
+    if (!(await sleepWithAutoFillCancel(getRandomCellSelectDelay()))) return false;
 
     const clickedDigit = clickDigitControl(digit);
     if (clickedDigit) return clickedCell;
@@ -564,9 +600,10 @@
   async function waitForCellValue(index, digit, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (state.autoFillCancelRequested) return false;
       const source = readGrid();
       if (source.grid && source.grid[index] === digit) return true;
-      await sleep(120);
+      if (!(await sleepWithAutoFillCancel(120))) return false;
     }
     return false;
   }
@@ -745,6 +782,15 @@
 
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function sleepWithAutoFillCancel(ms) {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (state.autoFillCancelRequested) return false;
+      await sleep(Math.min(80, deadline - Date.now()));
+    }
+    return !state.autoFillCancelRequested;
   }
 
   function findBoardElement() {
