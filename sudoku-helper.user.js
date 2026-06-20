@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.3
+// @version      0.7.4
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.3";
+  const SCRIPT_VERSION = "0.7.4";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -74,7 +74,10 @@
     lastLocationHref: window.location.href,
     boardRescanTimers: [],
     boardRescanStartedAt: 0,
+    awaitingFreshBoard: false,
     staleGridSignatures: new Set(),
+    expectedDifficulty: "",
+    expectedMode: "",
     networkHookInstalled: false,
     networkHookState: null,
   };
@@ -434,7 +437,10 @@
     const control = findBoardSwitchControl(event.target);
     if (!control) return;
 
-    scheduleBoardRescan("检测到难度/新局切换，正在读取新盘面...", { markStale: true });
+    scheduleBoardRescan("检测到难度/新局切换，正在读取新盘面...", {
+      markStale: true,
+      context: getGameContextFromElement(control),
+    });
   }
 
   function updateButtons() {
@@ -513,7 +519,7 @@
   function findBoardSwitchControl(target) {
     if (!target || typeof target.closest !== "function") return null;
 
-    const control = target.closest("a[href],button,[role='button'],[data-difficulty],[data-action]");
+    const control = target.closest("a[href],button,[role='button'],[data-difficulty],[data-mode],[data-action]");
     if (!control || isLikelyDigitControl(control)) return null;
 
     const text = [
@@ -522,15 +528,16 @@
       control.getAttribute("title"),
       control.getAttribute("data-action"),
       control.getAttribute("data-difficulty"),
+      control.getAttribute("data-mode"),
       control.getAttribute("href"),
       control.className,
       control.id,
     ].filter(Boolean).join(" ").toLowerCase();
 
     const hasDifficulty = (
-      /\b(easy|medium|hard|expert|evil)\b/.test(text) ||
-      /简单|中等|困难|专家|大师|极难|邪恶/.test(text) ||
-      /\/(easy|medium|hard|expert|evil)(\/|$|\?)/.test(text)
+      /\b(easy|medium|hard|expert|evil|extreme)\b/.test(text) ||
+      /简单|中等|困难|专家|大师|极难|极限|邪恶/.test(text) ||
+      /\/(easy|medium|hard|expert|evil|extreme)(\/|$|\?)/.test(text)
     );
     const startsNewGame = /new\s*game|new-game|restart|新游戏|重新开始|再来一局/.test(text);
 
@@ -546,8 +553,18 @@
   }
 
   function scheduleBoardRescan(notice, options = {}) {
-    if (options.markStale) rememberStaleGridsForRescan();
-    else state.staleGridSignatures.clear();
+    if (options.markStale) {
+      rememberStaleGridsForRescan();
+      const context = options.context || getCurrentGameContext();
+      state.expectedDifficulty = context.difficulty || "";
+      state.expectedMode = context.mode || "";
+      state.awaitingFreshBoard = state.staleGridSignatures.size > 0;
+    } else {
+      state.staleGridSignatures.clear();
+      state.awaitingFreshBoard = false;
+      state.expectedDifficulty = "";
+      state.expectedMode = "";
+    }
     resetBoardReadState();
     state.boardRescanStartedAt = Date.now();
     state.lastSignature = "";
@@ -569,11 +586,12 @@
   }
 
   function isBoardRescanActive() {
+    if (state.awaitingFreshBoard) return true;
     if (!state.boardRescanStartedAt) return false;
     if (Date.now() - state.boardRescanStartedAt <= BOARD_RESCAN_STALE_MS) return true;
 
     state.boardRescanStartedAt = 0;
-    state.staleGridSignatures.clear();
+    if (!state.awaitingFreshBoard) state.staleGridSignatures.clear();
     return false;
   }
 
@@ -605,6 +623,16 @@
 
     const lastGridSignature = String(state.lastSignature || "").split("|")[0];
     if (/^[0-9]{81}$/.test(lastGridSignature)) state.staleGridSignatures.add(lastGridSignature);
+  }
+
+  function markFreshBoardAccepted(grid) {
+    if (!state.awaitingFreshBoard || !Array.isArray(grid) || grid.length !== 81) return;
+    if (state.staleGridSignatures.has(grid.join(""))) return;
+
+    state.awaitingFreshBoard = false;
+    state.staleGridSignatures.clear();
+    state.boardRescanStartedAt = 0;
+    clearBoardRescanTimers();
   }
 
   function clearCapturedGames() {
@@ -644,6 +672,7 @@
     }
 
     clearNoGridRetry();
+    markFreshBoardAccepted(source.grid);
     rememberGoodSource(source);
     if (isBoardRescanActive() && !isStaleGrid(source.grid)) finishBoardRescan();
 
@@ -1052,11 +1081,11 @@
     }
 
     if (isBoardRescanActive()) {
-      const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
-      if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
-
       const stored = readStoredGame();
       if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
+
+      const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
+      if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
 
       const pageScript = readPageScriptGame();
       if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
@@ -1072,20 +1101,20 @@
         (!state.staleGridSignatures.size || hasFreshActiveBase())
       ) return runtime;
     } else {
-      const runtime = readWebpackGame();
-      if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
-
       const stored = readStoredGame();
       if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
 
       const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
       if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
 
+      const pageScript = readPageScriptGame();
+      if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
+
       const network = readNetworkGame();
       if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
 
-      const pageScript = readPageScriptGame();
-      if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
+      const runtime = readWebpackGame();
+      if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
     }
 
     const lastGood = readLastGoodGame();
@@ -1311,6 +1340,7 @@
     const capturedAt = Date.now();
     const capturedCandidates = [];
     for (const candidate of candidates) {
+      if (!candidateMatchesExpectedContext(candidate.game)) continue;
       const grid = gameToGrid(candidate.game);
       if (!grid) continue;
       if (isStaleGrid(grid)) continue;
@@ -1370,6 +1400,7 @@
     const ranked = state.networkCandidates
       .filter((item) => !maxAgeMs || now - item.capturedAt <= maxAgeMs)
       .filter((item) => shouldUseCurrentGrid(item.grid))
+      .filter((item) => candidateMatchesExpectedContext(item.game))
       .map((item) => ({
         ...item,
         score: scoreCandidate(item) + Math.max(0, 20 - Math.floor((now - item.capturedAt) / 30_000)),
@@ -1393,7 +1424,9 @@
   }
 
   function isStaleGrid(grid) {
-    if (!isBoardRescanActive() || !Array.isArray(grid) || grid.length !== 81) return false;
+    if (!Array.isArray(grid) || grid.length !== 81 || !state.staleGridSignatures.size) return false;
+    if (state.awaitingFreshBoard) return state.staleGridSignatures.has(grid.join(""));
+    if (!isBoardRescanActive()) return false;
     return state.staleGridSignatures.has(grid.join(""));
   }
 
@@ -1419,12 +1452,133 @@
     return true;
   }
 
+  function getCurrentGameContext() {
+    const active = document.querySelector(
+      "a[data-difficulty].active,a[data-mode].active,.new-game-menu-button.active,.start-new-game-button.active"
+    );
+    const activeContext = active ? getGameContextFromElement(active) : {};
+    return {
+      difficulty: state.expectedDifficulty ||
+        activeContext.difficulty ||
+        normalizeDifficulty(readWindowValue("difficulty")) ||
+        difficultyFromPath(window.location.href),
+      mode: state.expectedMode ||
+        activeContext.mode ||
+        normalizeMode(readWindowValue("mode")) ||
+        modeFromPath(window.location.href) ||
+        "classic",
+    };
+  }
+
+  function getGameContextFromElement(element) {
+    if (!element) return {};
+    const href = element.getAttribute("href") || "";
+    const text = [
+      element.getAttribute("data-difficulty"),
+      element.getAttribute("data-mode"),
+      element.textContent,
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      href,
+    ].filter(Boolean).join(" ");
+
+    return {
+      difficulty: normalizeDifficulty(element.getAttribute("data-difficulty")) ||
+        difficultyFromPath(href) ||
+        difficultyFromText(text),
+      mode: normalizeMode(element.getAttribute("data-mode")) || modeFromPath(href),
+    };
+  }
+
+  function candidateMatchesExpectedContext(game) {
+    if (!game || typeof game !== "object") return true;
+    const context = getCurrentGameContext();
+    const gameDifficulty = normalizeDifficulty(game.difficulty);
+    if (context.difficulty && gameDifficulty && gameDifficulty !== context.difficulty) return false;
+
+    const gameMode = normalizeMode(game.mode);
+    if (context.mode && gameMode && gameMode !== context.mode) return false;
+
+    return true;
+  }
+
+  function scoreExpectedContext(game) {
+    if (!game || typeof game !== "object") return 0;
+    const context = getCurrentGameContext();
+    let score = 0;
+
+    const gameDifficulty = normalizeDifficulty(game.difficulty);
+    if (context.difficulty && gameDifficulty) score += gameDifficulty === context.difficulty ? 80 : -220;
+
+    const gameMode = normalizeMode(game.mode);
+    if (context.mode && gameMode) score += gameMode === context.mode ? 35 : -160;
+
+    return score;
+  }
+
+  function readWindowValue(name) {
+    try {
+      return window[name];
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function difficultyFromPath(path) {
+    const text = String(path || "").toLowerCase();
+    if (/(^|\/)(easy|rongyi)(\/|$|\?)/.test(text)) return "easy";
+    if (/(^|\/)(medium|zhongdeng)(\/|$|\?)/.test(text)) return "medium";
+    if (/(^|\/)(hard|kunnan)(\/|$|\?)/.test(text)) return "hard";
+    if (/(^|\/)(expert|zhuanjia)(\/|$|\?)/.test(text)) return "expert";
+    if (/(^|\/)evil(\/|$|\?)/.test(text)) return "evil";
+    if (/(^|\/)extreme(\/|$|\?)/.test(text)) return "extreme";
+    return "";
+  }
+
+  function difficultyFromText(value) {
+    const text = String(value || "").toLowerCase();
+    if (/easy|简单/.test(text)) return "easy";
+    if (/medium|中等/.test(text)) return "medium";
+    if (/hard|困难/.test(text)) return "hard";
+    if (/expert|专家/.test(text)) return "expert";
+    if (/evil|大师|邪恶/.test(text)) return "evil";
+    if (/extreme|极限|极难/.test(text)) return "extreme";
+    return "";
+  }
+
+  function normalizeDifficulty(value) {
+    const text = String(value || "").toLowerCase().trim();
+    if (!text) return "";
+    return difficultyFromText(text) || difficultyFromPath(text);
+  }
+
+  function modeFromPath(path) {
+    const text = String(path || "").toLowerCase();
+    if (/(^|\/)killer(\/|$|\?)/.test(text)) return "killer";
+    if (/(^|\/)daily(\/|$|\?)/.test(text) || /daily-challenge/.test(text)) return "daily";
+    if (/(^|\/)postcards(\/|$|\?)/.test(text)) return "postcards";
+    if (/(^|\/)storybook(\/|$|\?)/.test(text)) return "storybook";
+    return "";
+  }
+
+  function normalizeMode(value) {
+    const text = String(value || "").toLowerCase().trim();
+    if (!text) return "";
+    if (/killer|杀手/.test(text)) return "killer";
+    if (/daily|每日/.test(text)) return "daily";
+    if (/postcards/.test(text)) return "postcards";
+    if (/storybook/.test(text)) return "storybook";
+    if (/classic|经典/.test(text)) return "classic";
+    return text;
+  }
+
   function readPageScriptGame() {
     scanPageScriptsForGames();
     if (!state.pageCandidates.length) return null;
 
     const ranked = state.pageCandidates
       .filter((item) => shouldUseCurrentGrid(item.grid))
+      .filter((item) => candidateMatchesExpectedContext(item.game))
       .map((item) => ({ ...item, score: scoreCandidate(item) + 15 }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
@@ -1565,8 +1719,9 @@
 
     const ranked = candidates
       .map((item) => ({ ...item, grid: gameToGrid(item.game) }))
-      .filter((item) => item.grid && (options.ignoreCurrentFilter || shouldUseCurrentGrid(item.grid)))
-      .map((item) => ({ ...item, score: scoreCandidate(item) + (item.path.includes(".state.currentGame") ? 60 : 30) }))
+      .filter((item) => item.grid && candidateMatchesExpectedContext(item.game))
+      .filter((item) => options.ignoreCurrentFilter || shouldUseCurrentGrid(item.grid))
+      .map((item) => ({ ...item, score: scoreCandidate(item) + scoreRuntimeCandidate(item) }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
     if (!best) return null;
@@ -1610,7 +1765,12 @@
       }
 
       if (value.state && isGameLike(value.state.currentGame)) {
-        candidates.push({ game: value.state.currentGame, path: `${currentPath}.state.currentGame` });
+        candidates.push({
+          game: value.state.currentGame,
+          path: `${currentPath}.state.currentGame`,
+          runtimeStore: true,
+          liveStore: isRuntimeStoreLike(value),
+        });
         return;
       }
 
@@ -1624,6 +1784,19 @@
     }
 
     walk(root, path, 0);
+  }
+
+  function isRuntimeStoreLike(value) {
+    return Boolean(
+      value &&
+      typeof value === "object" &&
+      value.state &&
+      (
+        typeof value.dispatch === "function" ||
+        typeof value.commit === "function" ||
+        value.vanilla
+      )
+    );
   }
 
   function readStoredGame() {
@@ -1656,7 +1829,7 @@
 
     const ranked = candidates
       .map((item) => ({ ...item, grid: gameToGrid(item.game) }))
-      .filter((item) => item.grid && shouldUseCurrentGrid(item.grid))
+      .filter((item) => item.grid && shouldUseCurrentGrid(item.grid) && candidateMatchesExpectedContext(item.game))
       .map((item) => ({ ...item, score: scoreCandidate(item) }))
       .sort((a, b) => b.score - a.score);
 
@@ -1838,7 +2011,15 @@
     if (game.loaded) score += 8;
     if (game.mode === "classic") score += 5;
     if (typeof game.timer === "number") score += Math.min(5, game.timer / 300);
+    score += scoreExpectedContext(game);
     return score;
+  }
+
+  function scoreRuntimeCandidate(item) {
+    if (item.liveStore) return 95;
+    if (item.runtimeStore) return 70;
+    if (item.path.includes(".state.currentGame")) return 50;
+    return 10;
   }
 
   function gameToGrid(game) {
