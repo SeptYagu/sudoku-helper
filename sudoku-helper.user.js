@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.2
+// @version      0.6.3
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,6 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
+  const SCRIPT_VERSION = "0.6.3";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -103,6 +104,19 @@
       font-weight: 700;
       color: #243447;
       flex: 0 0 auto;
+    }
+
+    .${APP_ID}-title {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .${APP_ID}-version {
+      color: #66758a;
+      font-size: 12px;
+      font-weight: 600;
     }
 
     .${APP_ID}-status {
@@ -274,7 +288,7 @@
     panel.id = `${APP_ID}-panel`;
     panel.innerHTML = `
       <div class="${APP_ID}-header">
-        <span>数独候选助手</span>
+        <span class="${APP_ID}-title"><span>数独候选助手</span><span class="${APP_ID}-version">v${SCRIPT_VERSION}</span></span>
         <button class="${APP_ID}-button" data-action="close" title="关闭">关闭</button>
       </div>
       <div class="${APP_ID}-buttons">
