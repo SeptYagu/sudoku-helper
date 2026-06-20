@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.5
+// @version      0.7.7
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.5";
+  const SCRIPT_VERSION = "0.7.7";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -32,6 +32,7 @@
   const HOOK_STATE_KEY = `${APP_ID}:networkHooks`;
   const ACTIVE_BASE_MAX_AGE_MS = 5 * 60 * 1000;
   const BOARD_RESCAN_STALE_MS = 12_000;
+  const ACCEPTED_BOARD_LOCATION_GRACE_MS = 5_000;
 
   if (window[API_NAME] && typeof window[API_NAME].destroy === "function") {
     window[API_NAME].destroy();
@@ -72,6 +73,7 @@
     activeBaseGrid: null,
     activeBaseCapturedAt: 0,
     lastLocationHref: window.location.href,
+    lastFreshBoardAcceptedAt: 0,
     boardRescanTimers: [],
     boardRescanStartedAt: 0,
     awaitingFreshBoard: false,
@@ -565,13 +567,13 @@
       state.expectedDifficulty = context.difficulty || "";
       state.expectedMode = context.mode || "";
       state.awaitingFreshBoard = state.staleGridSignatures.size > 0;
-    } else {
+    } else if (!options.keepStale) {
       state.staleGridSignatures.clear();
       state.awaitingFreshBoard = false;
       state.expectedDifficulty = "";
       state.expectedMode = "";
     }
-    resetBoardReadState();
+    resetBoardReadState(options);
     state.boardRescanStartedAt = Date.now();
     state.lastSignature = "";
     state.notice = notice;
@@ -606,16 +608,27 @@
   }
 
   function hardRefreshBoard() {
-    scheduleBoardRescan("正在重新读取当前棋盘...");
+    scheduleBoardRescan("正在重新读取当前棋盘...", {
+      keepActiveBase: true,
+      keepCaptured: true,
+      keepLastGood: true,
+      keepStale: state.awaitingFreshBoard || state.staleGridSignatures.size > 0,
+    });
   }
 
-  function resetBoardReadState() {
-    state.networkCandidates = [];
-    state.pageCandidates = [];
+  function resetBoardReadState(options = {}) {
+    if (!options.keepCaptured) {
+      state.networkCandidates = [];
+      state.pageCandidates = [];
+    }
     state.pageScanSignature = "";
-    state.activeBaseGrid = null;
-    state.activeBaseCapturedAt = 0;
-    state.lastGoodSource = null;
+    if (!options.keepActiveBase) {
+      state.activeBaseGrid = null;
+      state.activeBaseCapturedAt = 0;
+    }
+    if (!options.keepLastGood) {
+      state.lastGoodSource = null;
+    }
     state.noGridRetryCount = 0;
   }
 
@@ -644,6 +657,8 @@
     state.expectedDifficulty = "";
     state.expectedMode = "";
     state.boardRescanStartedAt = 0;
+    state.lastFreshBoardAcceptedAt = Date.now();
+    state.lastLocationHref = window.location.href;
     clearBoardRescanTimers();
   }
 
@@ -654,7 +669,8 @@
   function refresh(force) {
     if (window.location.href !== state.lastLocationHref) {
       state.lastLocationHref = window.location.href;
-      if (!state.awaitingFreshBoard && !state.staleGridSignatures.size) {
+      const acceptedFreshBoardRecently = Date.now() - state.lastFreshBoardAcceptedAt <= ACCEPTED_BOARD_LOCATION_GRACE_MS;
+      if (!state.awaitingFreshBoard && !state.staleGridSignatures.size && !acceptedFreshBoardRecently) {
         scheduleBoardRescan("检测到页面地址变化，正在读取新盘面...", { markStale: true });
         return;
       }
@@ -1564,7 +1580,7 @@
   function modeFromPath(path) {
     const text = String(path || "").toLowerCase();
     if (/(^|\/)killer(\/|$|\?)/.test(text)) return "killer";
-    if (/(^|\/)daily(\/|$|\?)/.test(text) || /daily-challenge/.test(text)) return "daily";
+    if (/(^|\/)(daily|challenges|mei-ri-shu-du)(\/|$|\?)/.test(text) || /daily-challenge/.test(text)) return "daily";
     if (/(^|\/)postcards(\/|$|\?)/.test(text)) return "postcards";
     if (/(^|\/)storybook(\/|$|\?)/.test(text)) return "storybook";
     return "";
@@ -1574,7 +1590,7 @@
     const text = String(value || "").toLowerCase().trim();
     if (!text) return "";
     if (/killer|杀手/.test(text)) return "killer";
-    if (/daily|每日/.test(text)) return "daily";
+    if (/daily|challenges|mei-ri-shu-du|每日/.test(text)) return "daily";
     if (/postcards/.test(text)) return "postcards";
     if (/storybook/.test(text)) return "storybook";
     if (/classic|经典/.test(text)) return "classic";
