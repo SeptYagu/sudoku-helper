@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.0
+// @version      0.7.1
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.0";
+  const SCRIPT_VERSION = "0.7.1";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -71,6 +71,7 @@
     activeBaseGrid: null,
     activeBaseCapturedAt: 0,
     lastLocationHref: window.location.href,
+    boardRescanTimers: [],
     networkHookInstalled: false,
     networkHookState: null,
   };
@@ -282,6 +283,7 @@
     refresh(true);
     window.addEventListener("resize", scheduleRefresh, { passive: true });
     window.addEventListener("scroll", scheduleRefresh, { passive: true });
+    document.addEventListener("click", onDocumentClick, true);
     state.timer = window.setInterval(() => refresh(false), 900);
 
     window[API_NAME] = {
@@ -423,6 +425,15 @@
     refresh(true);
   }
 
+  function onDocumentClick(event) {
+    if (state.panel && state.panel.contains(event.target)) return;
+
+    const control = findBoardSwitchControl(event.target);
+    if (!control) return;
+
+    scheduleBoardRescan("检测到难度/新局切换，正在读取新盘面...");
+  }
+
   function updateButtons() {
     if (!state.panel) return;
     state.panel.dataset.collapsed = String(state.panelCollapsed);
@@ -496,22 +507,62 @@
     window.requestAnimationFrame(() => refresh(false));
   }
 
-  function hardRefreshBoard() {
-    prepareBoardRescan();
+  function findBoardSwitchControl(target) {
+    if (!target || typeof target.closest !== "function") return null;
+
+    const control = target.closest("a[href],button,[role='button'],[data-difficulty],[data-action]");
+    if (!control || isLikelyDigitControl(control)) return null;
+
+    const text = [
+      control.textContent,
+      control.getAttribute("aria-label"),
+      control.getAttribute("title"),
+      control.getAttribute("data-action"),
+      control.getAttribute("data-difficulty"),
+      control.getAttribute("href"),
+      control.className,
+      control.id,
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    const hasDifficulty = (
+      /\b(easy|medium|hard|expert|evil)\b/.test(text) ||
+      /简单|中等|困难|专家|大师|极难|邪恶/.test(text) ||
+      /\/(easy|medium|hard|expert|evil)(\/|$|\?)/.test(text)
+    );
+    const startsNewGame = /new\s*game|new-game|restart|新游戏|重新开始|再来一局/.test(text);
+
+    return hasDifficulty || startsNewGame ? control : null;
+  }
+
+  function isLikelyDigitControl(element) {
+    const text = (element.textContent || "").trim();
+    if (/^[1-9]$/.test(text)) return true;
+
+    const boardRect = (state.boardElement || findBoardElement())?.getBoundingClientRect();
+    return isInsideSquareBoard(element, boardRect);
+  }
+
+  function scheduleBoardRescan(notice) {
+    resetBoardReadState();
     state.lastSignature = "";
-    state.notice = "正在重新读取当前棋盘...";
-    refresh(true);
-    window.setTimeout(() => refresh(true), 450);
-    window.setTimeout(() => refresh(true), 1200);
+    state.notice = notice;
+
+    clearBoardRescanTimers();
+    state.boardRescanTimers = [0, 120, 350, 800, 1400, 2400, 4200, 6500].map((delay) => (
+      window.setTimeout(() => refresh(true), delay)
+    ));
   }
 
-  function prepareBoardRescan() {
-    state.pageCandidates = [];
-    state.pageScanSignature = "";
-    state.noGridRetryCount = 0;
+  function clearBoardRescanTimers() {
+    state.boardRescanTimers.forEach((timer) => window.clearTimeout(timer));
+    state.boardRescanTimers = [];
   }
 
-  function clearCapturedGames() {
+  function hardRefreshBoard() {
+    scheduleBoardRescan("正在重新读取当前棋盘...");
+  }
+
+  function resetBoardReadState() {
     state.networkCandidates = [];
     state.pageCandidates = [];
     state.pageScanSignature = "";
@@ -519,6 +570,10 @@
     state.activeBaseCapturedAt = 0;
     state.lastGoodSource = null;
     state.noGridRetryCount = 0;
+  }
+
+  function clearCapturedGames() {
+    resetBoardReadState();
   }
 
   function refresh(force) {
@@ -2357,8 +2412,10 @@
   function destroy() {
     window.clearInterval(state.timer);
     clearNoGridRetry();
+    clearBoardRescanTimers();
     window.removeEventListener("resize", scheduleRefresh);
     window.removeEventListener("scroll", scheduleRefresh);
+    document.removeEventListener("click", onDocumentClick, true);
     restoreNetworkHooks();
     if (state.overlay) state.overlay.remove();
     if (state.panel) state.panel.remove();
