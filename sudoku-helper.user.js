@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.4
+// @version      0.6.5
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.4";
+  const SCRIPT_VERSION = "0.6.5";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -56,11 +56,15 @@
     autoFillSpeed: readStoredAutoFillSpeed(),
     notice: "",
     timer: 0,
+    noGridRetryTimer: 0,
+    noGridRetryCount: 0,
     lastSignature: "",
     lastResult: null,
     lastDiagnostics: null,
     webpackRequire: null,
     networkCandidates: [],
+    pageCandidates: [],
+    pageScanSignature: "",
     networkHookInstalled: false,
   };
 
@@ -507,8 +511,11 @@
     if (!source.grid) {
       clearOverlay();
       renderStatus(source);
+      scheduleNoGridRetry();
       return;
     }
+
+    clearNoGridRetry();
 
     const result = analyzeGrid(source.grid);
     state.lastResult = result;
@@ -833,6 +840,23 @@
     return !state.autoFillCancelRequested;
   }
 
+  function scheduleNoGridRetry() {
+    if (state.noGridRetryTimer || state.noGridRetryCount >= 12) return;
+    state.noGridRetryCount += 1;
+    const delay = Math.min(1800, 220 + state.noGridRetryCount * 140);
+    state.noGridRetryTimer = window.setTimeout(() => {
+      state.noGridRetryTimer = 0;
+      refresh(true);
+    }, delay);
+  }
+
+  function clearNoGridRetry() {
+    state.noGridRetryCount = 0;
+    if (!state.noGridRetryTimer) return;
+    window.clearTimeout(state.noGridRetryTimer);
+    state.noGridRetryTimer = 0;
+  }
+
   function findBoardElement() {
     return (
       document.querySelector("#game canvas") ||
@@ -906,13 +930,16 @@
     const network = readNetworkGame();
     if (network && network.grid) return network;
 
+    const pageScript = readPageScriptGame();
+    if (pageScript && pageScript.grid) return pageScript;
+
     const diagnostics = diagnose(false);
     return {
       grid: null,
       source: "未读取到盘面",
       detail: [
-        "没有从运行时或本地存储读到当前盘面。",
-        "请先等棋盘加载完成；新版会自动监听题目接口，不需要先填数字。",
+        "没有从运行时、本地存储、题目接口或页面脚本里读到当前盘面。",
+        "请先等棋盘加载完成；新版会自动监听题目接口并扫描页面数据。",
         "也可以打开“手动盘面”粘贴 81 位盘面。",
         diagnostics && diagnostics.short ? `诊断: ${diagnostics.short}` : "",
       ].filter(Boolean).join("\n"),
@@ -946,8 +973,15 @@
         XHR.prototype.send = function sudokuHelperSendHook(...args) {
           try {
             this.addEventListener("loadend", () => {
-              if (typeof this.responseText === "string") {
-                recordResponseText(this.responseText, this.__sudokuHelperUrl || "xhr");
+              try {
+                if (this.response && typeof this.response === "object") {
+                  recordGamePayload(this.response, this.__sudokuHelperUrl || "xhr.response");
+                }
+                if (typeof this.responseText === "string") {
+                  recordResponseText(this.responseText, this.__sudokuHelperUrl || "xhr");
+                }
+              } catch (error) {
+                // Some responseType values disallow responseText.
               }
             });
           } catch (error) {
@@ -1038,6 +1072,138 @@
       source: best.path,
       detail: best.game.id ? `题目 ID: ${best.game.id}` : "自动抓取 sudoku.com 题目接口",
     };
+  }
+
+  function readPageScriptGame() {
+    scanPageScriptsForGames();
+    if (!state.pageCandidates.length) return null;
+
+    const ranked = state.pageCandidates
+      .map((item) => ({ ...item, score: scoreCandidate(item) + 15 }))
+      .sort((a, b) => b.score - a.score);
+    const best = ranked[0];
+    if (!best) return null;
+
+    return {
+      grid: best.grid,
+      source: best.path,
+      detail: best.game.id ? `题目 ID: ${best.game.id}` : "扫描页面脚本里的题面数据",
+    };
+  }
+
+  function scanPageScriptsForGames() {
+    const scripts = Array.from(document.scripts || []);
+    const signature = [
+      window.location.href,
+      scripts.length,
+      scripts.reduce((sum, script) => sum + (script.textContent || "").length, 0),
+      Boolean(window.__NEXT_DATA__),
+    ].join("|");
+    if (signature === state.pageScanSignature && state.pageCandidates.length) return;
+    state.pageScanSignature = signature;
+
+    const candidates = [];
+    if (window.__NEXT_DATA__) {
+      collectGameCandidates(window.__NEXT_DATA__, "page.__NEXT_DATA__", candidates);
+      collectLegacyPayloadCandidates(window.__NEXT_DATA__, "page.__NEXT_DATA__", candidates);
+    }
+
+    scripts.forEach((script, index) => {
+      const text = script.textContent || "";
+      if (!text || text.length > 2_000_000) return;
+      if (!/clearGrid|solvedGrid|puzzleGrid|mission|values|sudoku|game/i.test(text)) return;
+
+      const trimmed = text.trim();
+      if (trimmed && "[{".includes(trimmed[0])) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          collectGameCandidates(parsed, `page.script[${index}]`, candidates);
+          collectLegacyPayloadCandidates(parsed, `page.script[${index}]`, candidates);
+        } catch (error) {
+          // Inline application scripts often are not pure JSON.
+        }
+      }
+
+      collectInlineGridCandidates(text, `page.script[${index}]`, candidates);
+    });
+
+    const seen = new Set();
+    state.pageCandidates = candidates
+      .map((candidate) => ({ ...candidate, grid: gameToGrid(candidate.game), capturedAt: Date.now() }))
+      .filter((candidate) => candidate.grid)
+      .filter((candidate) => {
+        const key = `${candidate.grid.join("")}|${candidate.path}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 30);
+  }
+
+  function collectInlineGridCandidates(text, path, candidates) {
+    const found = {};
+    const stringGrid = /["']?(clearGrid|mission|puzzleGrid|solvedGrid|solution|userGrid|values)["']?\s*[:=]\s*["']([0-9.]{81})["']/gi;
+    const arrayGrid = /["']?(clearGrid|mission|puzzleGrid|solvedGrid|solution|userGrid|values)["']?\s*[:=]\s*\[([\s\S]{0,900}?)\]/gi;
+
+    for (const match of text.matchAll(stringGrid)) {
+      const key = match[1];
+      const grid = normalizeGridString(match[2]);
+      if (grid) {
+        if (!found[key]) found[key] = [];
+        found[key].push(grid.join(""));
+      }
+    }
+
+    for (const match of text.matchAll(arrayGrid)) {
+      const key = match[1];
+      const grid = normalizeGridString(match[2]);
+      if (grid) {
+        if (!found[key]) found[key] = [];
+        found[key].push(grid.join(""));
+      }
+    }
+
+    const missions = [
+      ...(found.clearGrid || []),
+      ...(found.mission || []),
+      ...(found.puzzleGrid || []),
+    ];
+    const users = found.userGrid || [];
+    const solutions = [
+      ...(found.solvedGrid || []),
+      ...(found.solution || []),
+    ];
+
+    missions.forEach((mission, index) => {
+      const base = normalizeGridString(mission);
+      if (!base) return;
+      const user = normalizeGridString(users[index] || "");
+      const values = user ? base.map((digit, cell) => digit || user[cell] || 0) : base;
+      candidates.push({
+        path: `${path}.inlineGrid`,
+        game: {
+          values,
+          mission,
+          solution: solutions[index],
+          loaded: true,
+          mode: "classic",
+        },
+      });
+    });
+
+    (found.values || []).forEach((value, index) => {
+      const values = normalizeGridString(value);
+      if (!values) return;
+      candidates.push({
+        path: `${path}.inlineValues[${index}]`,
+        game: {
+          values,
+          mission: values.join(""),
+          loaded: true,
+          mode: "classic",
+        },
+      });
+    });
   }
 
   function readWebpackGame() {
@@ -1386,12 +1552,14 @@
     const webpackRequire = getWebpackRequire();
     const webpackCount = webpackRequire && webpackRequire.c ? Object.keys(webpackRequire.c).length : 0;
     const boardFound = Boolean(findBoardElement());
+    scanPageScriptsForGames();
     const info = {
       boardFound,
       webpackModules: webpackCount,
       capturedNetworkGames: state.networkCandidates.length,
+      capturedPageGames: state.pageCandidates.length,
       storage: storageInfo,
-      short: `board=${boardFound}, webpackModules=${webpackCount}, network=${state.networkCandidates.length}, keys=${storageInfo.map((item) => `${item.name}:${item.relevant.join(",") || "-"}`).join(" | ")}`,
+      short: `board=${boardFound}, webpackModules=${webpackCount}, network=${state.networkCandidates.length}, page=${state.pageCandidates.length}, keys=${storageInfo.map((item) => `${item.name}:${item.relevant.join(",") || "-"}`).join(" | ")}`,
     };
     state.lastDiagnostics = info;
 
@@ -1966,6 +2134,7 @@
 
   function destroy() {
     window.clearInterval(state.timer);
+    clearNoGridRetry();
     window.removeEventListener("resize", scheduleRefresh);
     window.removeEventListener("scroll", scheduleRefresh);
     if (state.overlay) state.overlay.remove();
