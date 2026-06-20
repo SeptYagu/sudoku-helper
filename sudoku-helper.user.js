@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.7
+// @version      0.6.8
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.7";
+  const SCRIPT_VERSION = "0.6.8";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -69,6 +69,8 @@
     activeBaseGrid: null,
     activeBaseCapturedAt: 0,
     lastLocationHref: window.location.href,
+    gameSwitchStartedAt: 0,
+    gameSwitchTimers: [],
     networkHookInstalled: false,
   };
 
@@ -279,6 +281,7 @@
     refresh(true);
     window.addEventListener("resize", scheduleRefresh, { passive: true });
     window.addEventListener("scroll", scheduleRefresh, { passive: true });
+    document.addEventListener("click", onDocumentClick, true);
     state.timer = window.setInterval(() => refresh(false), 900);
 
     window[API_NAME] = {
@@ -405,6 +408,18 @@
     if (action === "diagnose") diagnose(true);
   }
 
+  function onDocumentClick(event) {
+    if (state.panel && state.panel.contains(event.target)) return;
+
+    const control = event.target.closest("button,[role='button'],a,[data-difficulty],[data-action],[class*='difficulty'],[class*='new']");
+    if (!control) return;
+
+    const kind = classifyGameSwitchControl(control);
+    if (!kind) return;
+
+    scheduleGameSwitchRescan(kind);
+  }
+
   function onPanelInput(event) {
     if (event.target === state.speedInput) {
       state.autoFillSpeed = normalizeAutoFillSpeed(event.target.value);
@@ -491,6 +506,50 @@
 
   function scheduleRefresh() {
     window.requestAnimationFrame(() => refresh(false));
+  }
+
+  function classifyGameSwitchControl(control) {
+    const text = [
+      control.textContent,
+      control.getAttribute("aria-label"),
+      control.getAttribute("title"),
+      control.getAttribute("data-action"),
+      control.getAttribute("data-difficulty"),
+      control.className,
+      control.id,
+      control.getAttribute("href"),
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    if (/new\s*game|new-game|restart|新游戏|重新开始|再来一局/.test(text)) return "hard";
+    if (/\b(easy|medium|hard|expert|evil)\b|简单|中等|困难|专家|大师|极难|邪恶/.test(text)) return "hard";
+    if (/difficulty|难度/.test(text)) return "soft";
+    return "";
+  }
+
+  function scheduleGameSwitchRescan(kind) {
+    prepareBoardRescan();
+    state.gameSwitchStartedAt = Date.now();
+    state.activeBaseGrid = null;
+    state.activeBaseCapturedAt = 0;
+    state.lastSignature = "";
+    state.notice = kind === "hard" ? "检测到难度/新局切换，正在读取新盘面..." : "检测到难度菜单操作，正在重新检查盘面...";
+
+    if (kind === "hard") {
+      state.networkCandidates = [];
+    }
+
+    state.gameSwitchTimers.forEach((timer) => window.clearTimeout(timer));
+    state.gameSwitchTimers = [80, 300, 700, 1200, 2000, 3500, 5500, 8000].map((delay) => (
+      window.setTimeout(() => {
+        refresh(true);
+      }, delay)
+    ));
+
+    refresh(true);
+  }
+
+  function isGameSwitchPending() {
+    return state.gameSwitchStartedAt && Date.now() - state.gameSwitchStartedAt < 8000;
   }
 
   function hardRefreshBoard() {
@@ -958,19 +1017,19 @@
     }
 
     const runtime = readWebpackGame();
-    if (runtime && runtime.grid) return runtime;
+    if (runtime && runtime.grid && shouldUseSourceAfterGameSwitch(runtime)) return runtime;
 
     const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
-    if (freshNetwork && freshNetwork.grid) return freshNetwork;
+    if (freshNetwork && freshNetwork.grid && shouldUseSourceAfterGameSwitch(freshNetwork)) return freshNetwork;
 
     const stored = readStoredGame();
-    if (stored && stored.grid && shouldUseStoredGrid(stored.grid)) return stored;
+    if (stored && stored.grid && shouldUseStoredGrid(stored.grid) && shouldUseSourceAfterGameSwitch(stored)) return stored;
 
     const network = readNetworkGame();
-    if (network && network.grid) return network;
+    if (network && network.grid && shouldUseSourceAfterGameSwitch(network)) return network;
 
     const pageScript = readPageScriptGame();
-    if (pageScript && pageScript.grid) return pageScript;
+    if (pageScript && pageScript.grid && shouldUseSourceAfterGameSwitch(pageScript)) return pageScript;
 
     const lastGood = readLastGoodGame();
     if (lastGood && lastGood.grid) return lastGood;
@@ -1009,6 +1068,17 @@
         state.lastGoodSource.detail,
       ].filter(Boolean).join("\n"),
     };
+  }
+
+  function shouldUseSourceAfterGameSwitch(source) {
+    if (!isGameSwitchPending() || !state.lastGoodSource || !source.grid) return true;
+    if (!sameGrid(source.grid, state.lastGoodSource.grid)) return true;
+    return Date.now() - state.gameSwitchStartedAt > 4500;
+  }
+
+  function sameGrid(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((digit, index) => digit === right[index]);
   }
 
   function installNetworkHooks() {
@@ -2235,8 +2305,11 @@
   function destroy() {
     window.clearInterval(state.timer);
     clearNoGridRetry();
+    state.gameSwitchTimers.forEach((timer) => window.clearTimeout(timer));
+    state.gameSwitchTimers = [];
     window.removeEventListener("resize", scheduleRefresh);
     window.removeEventListener("scroll", scheduleRefresh);
+    document.removeEventListener("click", onDocumentClick, true);
     if (state.overlay) state.overlay.remove();
     if (state.panel) state.panel.remove();
     const style = document.getElementById(`${APP_ID}-style`);
