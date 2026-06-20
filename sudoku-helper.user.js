@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.1
+// @version      0.7.2
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.1";
+  const SCRIPT_VERSION = "0.7.2";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -31,6 +31,7 @@
   const SPEED_STORAGE_KEY = `${APP_ID}:autoFillSpeed`;
   const HOOK_STATE_KEY = `${APP_ID}:networkHooks`;
   const ACTIVE_BASE_MAX_AGE_MS = 5 * 60 * 1000;
+  const BOARD_RESCAN_STALE_MS = 12_000;
 
   if (window[API_NAME] && typeof window[API_NAME].destroy === "function") {
     window[API_NAME].destroy();
@@ -72,6 +73,8 @@
     activeBaseCapturedAt: 0,
     lastLocationHref: window.location.href,
     boardRescanTimers: [],
+    boardRescanStartedAt: 0,
+    staleGridSignatures: new Set(),
     networkHookInstalled: false,
     networkHookState: null,
   };
@@ -431,7 +434,7 @@
     const control = findBoardSwitchControl(event.target);
     if (!control) return;
 
-    scheduleBoardRescan("检测到难度/新局切换，正在读取新盘面...");
+    scheduleBoardRescan("检测到难度/新局切换，正在读取新盘面...", { markStale: true });
   }
 
   function updateButtons() {
@@ -542,8 +545,11 @@
     return isInsideSquareBoard(element, boardRect);
   }
 
-  function scheduleBoardRescan(notice) {
+  function scheduleBoardRescan(notice, options = {}) {
+    if (options.markStale) rememberStaleGridsForRescan();
+    else state.staleGridSignatures.clear();
     resetBoardReadState();
+    state.boardRescanStartedAt = Date.now();
     state.lastSignature = "";
     state.notice = notice;
 
@@ -556,6 +562,19 @@
   function clearBoardRescanTimers() {
     state.boardRescanTimers.forEach((timer) => window.clearTimeout(timer));
     state.boardRescanTimers = [];
+  }
+
+  function finishBoardRescan() {
+    clearBoardRescanTimers();
+    state.boardRescanStartedAt = 0;
+    state.staleGridSignatures.clear();
+  }
+
+  function isBoardRescanActive() {
+    return Boolean(
+      state.boardRescanStartedAt &&
+      Date.now() - state.boardRescanStartedAt <= BOARD_RESCAN_STALE_MS
+    );
   }
 
   function hardRefreshBoard() {
@@ -572,6 +591,22 @@
     state.noGridRetryCount = 0;
   }
 
+  function rememberStaleGridsForRescan() {
+    state.staleGridSignatures = new Set();
+    const remember = (grid) => {
+      if (Array.isArray(grid) && grid.length === 81) state.staleGridSignatures.add(grid.join(""));
+    };
+
+    remember(state.lastGoodSource && state.lastGoodSource.grid);
+    remember(state.activeBaseGrid);
+    remember(readWebpackGame({ ignoreCurrentFilter: true })?.grid);
+    state.networkCandidates.forEach((candidate) => remember(candidate.grid));
+    state.pageCandidates.forEach((candidate) => remember(candidate.grid));
+
+    const lastGridSignature = String(state.lastSignature || "").split("|")[0];
+    if (/^[0-9]{81}$/.test(lastGridSignature)) state.staleGridSignatures.add(lastGridSignature);
+  }
+
   function clearCapturedGames() {
     resetBoardReadState();
   }
@@ -579,8 +614,8 @@
   function refresh(force) {
     if (window.location.href !== state.lastLocationHref) {
       state.lastLocationHref = window.location.href;
-      clearCapturedGames();
-      state.lastSignature = "";
+      scheduleBoardRescan("检测到页面地址变化，正在读取新盘面...", { markStale: true });
+      return;
     }
 
     const board = findBoardElement();
@@ -610,6 +645,7 @@
 
     clearNoGridRetry();
     rememberGoodSource(source);
+    if (isBoardRescanActive() && !isStaleGrid(source.grid)) finishBoardRescan();
 
     const result = analyzeGrid(source.grid);
     state.lastResult = result;
@@ -1015,20 +1051,42 @@
       }
     }
 
-    const runtime = readWebpackGame();
-    if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
+    if (isBoardRescanActive()) {
+      const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
+      if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
 
-    const stored = readStoredGame();
-    if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
+      const stored = readStoredGame();
+      if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
 
-    const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
-    if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
+      const pageScript = readPageScriptGame();
+      if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
 
-    const network = readNetworkGame();
-    if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
+      const network = readNetworkGame();
+      if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
 
-    const pageScript = readPageScriptGame();
-    if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
+      const runtime = readWebpackGame();
+      if (
+        runtime &&
+        runtime.grid &&
+        shouldUseCurrentGrid(runtime.grid) &&
+        (!state.staleGridSignatures.size || hasFreshActiveBase())
+      ) return runtime;
+    } else {
+      const runtime = readWebpackGame();
+      if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
+
+      const stored = readStoredGame();
+      if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
+
+      const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
+      if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
+
+      const network = readNetworkGame();
+      if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
+
+      const pageScript = readPageScriptGame();
+      if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
+    }
 
     const lastGood = readLastGoodGame();
     if (lastGood && lastGood.grid && shouldUseCurrentGrid(lastGood.grid)) return lastGood;
@@ -1326,8 +1384,14 @@
 
   function shouldUseCurrentGrid(grid) {
     if (!Array.isArray(grid) || grid.length !== 81) return false;
+    if (isStaleGrid(grid)) return false;
     if (!hasFreshActiveBase()) return true;
     return gridMatchesBaseGrid(grid, state.activeBaseGrid);
+  }
+
+  function isStaleGrid(grid) {
+    if (!isBoardRescanActive() || !Array.isArray(grid) || grid.length !== 81) return false;
+    return state.staleGridSignatures.has(grid.join(""));
   }
 
   function getBaseGridForGame(game, fallbackGrid) {
@@ -1485,7 +1549,7 @@
     });
   }
 
-  function readWebpackGame() {
+  function readWebpackGame(options = {}) {
     const webpackRequire = getWebpackRequire();
     const moduleCache = webpackRequire && webpackRequire.c;
     if (!moduleCache || typeof moduleCache !== "object") return null;
@@ -1498,7 +1562,7 @@
 
     const ranked = candidates
       .map((item) => ({ ...item, grid: gameToGrid(item.game) }))
-      .filter((item) => item.grid && shouldUseCurrentGrid(item.grid))
+      .filter((item) => item.grid && (options.ignoreCurrentFilter || shouldUseCurrentGrid(item.grid)))
       .map((item) => ({ ...item, score: scoreCandidate(item) + (item.path.includes(".state.currentGame") ? 60 : 30) }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
