@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.5.0
+// @version      0.6.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -205,9 +205,19 @@
     .${APP_ID}-hint-list li {
       display: flex;
       justify-content: space-between;
+      align-items: flex-start;
       gap: 10px;
       padding: 5px 0;
       border-top: 1px solid rgba(52, 72, 97, 0.1);
+    }
+
+    .${APP_ID}-hint-list li[data-kind="logic"] {
+      display: block;
+    }
+
+    .${APP_ID}-reason {
+      display: block;
+      color: #3d4f66;
     }
 
     .${APP_ID}-muted {
@@ -1291,15 +1301,9 @@
   }
 
   function analyzeGrid(grid) {
-    const candidates = Array.from({ length: 81 }, (_, index) => {
-      if (grid[index]) return [];
-      const used = new Set();
-      for (const peer of peers(index)) {
-        if (grid[peer]) used.add(grid[peer]);
-      }
-      return DIGITS.filter((digit) => !used.has(digit));
-    });
-
+    const baseCandidates = buildBaseCandidates(grid);
+    const logic = applyLogicalReductions(grid, baseCandidates);
+    const candidates = logic.candidates;
     const conflicts = findConflicts(grid);
     const nakedSingles = [];
     for (let index = 0; index < 81; index += 1) {
@@ -1321,9 +1325,39 @@
       nakedSingles,
       hiddenSingles,
       strongHints: Array.from(strongByCell.values()).sort((a, b) => a.index - b.index || a.digit - b.digit),
+      logicSteps: logic.steps,
       filled: grid.filter(Boolean).length,
       empty: grid.filter((digit) => !digit).length,
     };
+  }
+
+  function buildBaseCandidates(grid) {
+    return Array.from({ length: 81 }, (_, index) => {
+      if (grid[index]) return [];
+      const used = new Set();
+      for (const peer of peers(index)) {
+        if (grid[peer]) used.add(grid[peer]);
+      }
+      return DIGITS.filter((digit) => !used.has(digit));
+    });
+  }
+
+  function applyLogicalReductions(grid, baseCandidates) {
+    const candidates = baseCandidates.map((values) => values.slice());
+    const steps = [];
+
+    for (let round = 0; round < 12; round += 1) {
+      let changed = false;
+      changed = applyPointing(grid, candidates, steps) || changed;
+      changed = applyClaiming(grid, candidates, steps) || changed;
+      changed = applyNakedSubsets(grid, candidates, steps) || changed;
+      changed = applyHiddenSubsets(grid, candidates, steps) || changed;
+      changed = applyXWing(grid, candidates, steps) || changed;
+      if (!changed) break;
+      if (steps.length > 80) break;
+    }
+
+    return { candidates, steps };
   }
 
   function peers(index) {
@@ -1348,15 +1382,33 @@
 
   function units() {
     const all = [];
-    for (let row = 0; row < 9; row += 1) all.push({ type: "行唯一", cells: DIGITS.map((_, col) => row * 9 + col) });
-    for (let col = 0; col < 9; col += 1) all.push({ type: "列唯一", cells: DIGITS.map((_, row) => row * 9 + col) });
+    for (let row = 0; row < 9; row += 1) all.push({
+      type: "行唯一",
+      kind: "row",
+      index: row,
+      label: `第${row + 1}行`,
+      cells: DIGITS.map((_, col) => row * 9 + col),
+    });
+    for (let col = 0; col < 9; col += 1) all.push({
+      type: "列唯一",
+      kind: "col",
+      index: col,
+      label: `第${col + 1}列`,
+      cells: DIGITS.map((_, row) => row * 9 + col),
+    });
     for (let br = 0; br < 3; br += 1) {
       for (let bc = 0; bc < 3; bc += 1) {
         const cells = [];
         for (let r = br * 3; r < br * 3 + 3; r += 1) {
           for (let c = bc * 3; c < bc * 3 + 3; c += 1) cells.push(r * 9 + c);
         }
-        all.push({ type: "宫唯一", cells });
+        all.push({
+          type: "宫唯一",
+          kind: "box",
+          index: br * 3 + bc,
+          label: `第${br * 3 + bc + 1}宫`,
+          cells,
+        });
       }
     }
     return all;
@@ -1373,6 +1425,239 @@
       }
     }
     return hints;
+  }
+
+  function applyPointing(grid, candidates, steps) {
+    let changed = false;
+    for (const box of units().filter((unit) => unit.kind === "box")) {
+      for (const digit of DIGITS) {
+        const places = box.cells.filter((index) => !grid[index] && candidates[index].includes(digit));
+        if (places.length < 2) continue;
+
+        const rows = [...new Set(places.map((index) => rowCol(index).row))];
+        const cols = [...new Set(places.map((index) => rowCol(index).col))];
+        if (rows.length === 1) {
+          const targets = rowCells(rows[0]).filter((index) => !box.cells.includes(index));
+          changed = applyElimination(candidates, targets, [digit], {
+            technique: "宫内指向",
+            reason: `${box.label}里的 ${digit} 只能落在第${rows[0] + 1}行，所以这一行其他宫不能再有 ${digit}。`,
+            basisCells: places,
+          }, steps) || changed;
+        }
+        if (cols.length === 1) {
+          const targets = colCells(cols[0]).filter((index) => !box.cells.includes(index));
+          changed = applyElimination(candidates, targets, [digit], {
+            technique: "宫内指向",
+            reason: `${box.label}里的 ${digit} 只能落在第${cols[0] + 1}列，所以这一列其他宫不能再有 ${digit}。`,
+            basisCells: places,
+          }, steps) || changed;
+        }
+      }
+    }
+    return changed;
+  }
+
+  function applyClaiming(grid, candidates, steps) {
+    let changed = false;
+    for (const unit of units().filter((item) => item.kind === "row" || item.kind === "col")) {
+      for (const digit of DIGITS) {
+        const places = unit.cells.filter((index) => !grid[index] && candidates[index].includes(digit));
+        if (places.length < 2) continue;
+
+        const boxes = [...new Set(places.map((index) => boxIndex(index)))];
+        if (boxes.length !== 1) continue;
+
+        const box = units().find((item) => item.kind === "box" && item.index === boxes[0]);
+        const targets = box.cells.filter((index) => !unit.cells.includes(index));
+        changed = applyElimination(candidates, targets, [digit], {
+          technique: "行列锁定",
+          reason: `${unit.label}里的 ${digit} 只能落在${box.label}，所以${box.label}其他格不能再有 ${digit}。`,
+          basisCells: places,
+        }, steps) || changed;
+      }
+    }
+    return changed;
+  }
+
+  function applyNakedSubsets(grid, candidates, steps) {
+    let changed = false;
+    for (const unit of units()) {
+      const cells = unit.cells.filter((index) => !grid[index] && candidates[index].length >= 2 && candidates[index].length <= 4);
+      for (const size of [2, 3, 4]) {
+        for (const combo of combinations(cells, size)) {
+          const digits = uniqueDigits(combo.flatMap((index) => candidates[index]));
+          if (digits.length !== size) continue;
+
+          const lockedCells = unit.cells.filter((index) => (
+            !grid[index] &&
+            candidates[index].length > 0 &&
+            candidates[index].every((digit) => digits.includes(digit))
+          ));
+          if (!sameMembers(lockedCells, combo)) continue;
+
+          const targets = unit.cells.filter((index) => !combo.includes(index));
+          changed = applyElimination(candidates, targets, digits, {
+            technique: `裸${subsetName(size)}`,
+            reason: `${unit.label}中 ${cellList(combo)} 只能放 ${digitList(digits)}，所以本单位其他格可删这些候选。`,
+            basisCells: combo,
+          }, steps) || changed;
+        }
+      }
+    }
+    return changed;
+  }
+
+  function applyHiddenSubsets(grid, candidates, steps) {
+    let changed = false;
+    for (const unit of units()) {
+      for (const size of [2, 3]) {
+        for (const digits of combinations(DIGITS, size)) {
+          const places = unit.cells.filter((index) => !grid[index] && digits.some((digit) => candidates[index].includes(digit)));
+          if (places.length !== size) continue;
+
+          const removable = places.some((index) => candidates[index].some((digit) => !digits.includes(digit)));
+          if (!removable) continue;
+
+          for (const index of places) {
+            const remove = candidates[index].filter((digit) => !digits.includes(digit));
+            changed = applyElimination(candidates, [index], remove, {
+              technique: `隐藏${subsetName(size)}`,
+              reason: `${unit.label}中 ${digitList(digits)} 只出现在 ${cellList(places)}，这些格只保留这组数字。`,
+              basisCells: places,
+            }, steps) || changed;
+          }
+        }
+      }
+    }
+    return changed;
+  }
+
+  function applyXWing(grid, candidates, steps) {
+    let changed = false;
+    for (const digit of DIGITS) {
+      const rowPairs = DIGITS.map((_, row) => ({
+        row,
+        cols: DIGITS.map((__, col) => col).filter((col) => !grid[row * 9 + col] && candidates[row * 9 + col].includes(digit)),
+      })).filter((item) => item.cols.length === 2);
+
+      for (const [a, b] of combinations(rowPairs, 2)) {
+        if (!sameMembers(a.cols, b.cols)) continue;
+        const targets = a.cols.flatMap((col) => colCells(col).filter((index) => {
+          const row = rowCol(index).row;
+          return row !== a.row && row !== b.row;
+        }));
+        changed = applyElimination(candidates, targets, [digit], {
+          technique: "X-Wing",
+          reason: `${digit} 在第${a.row + 1}行和第${b.row + 1}行都只可能出现在第${a.cols[0] + 1}/${a.cols[1] + 1}列，所以这两列其他行可删 ${digit}。`,
+          basisCells: [a.row * 9 + a.cols[0], a.row * 9 + a.cols[1], b.row * 9 + b.cols[0], b.row * 9 + b.cols[1]],
+        }, steps) || changed;
+      }
+
+      const colPairs = DIGITS.map((_, col) => ({
+        col,
+        rows: DIGITS.map((__, row) => row).filter((row) => !grid[row * 9 + col] && candidates[row * 9 + col].includes(digit)),
+      })).filter((item) => item.rows.length === 2);
+
+      for (const [a, b] of combinations(colPairs, 2)) {
+        if (!sameMembers(a.rows, b.rows)) continue;
+        const targets = a.rows.flatMap((row) => rowCells(row).filter((index) => {
+          const col = rowCol(index).col;
+          return col !== a.col && col !== b.col;
+        }));
+        changed = applyElimination(candidates, targets, [digit], {
+          technique: "X-Wing",
+          reason: `${digit} 在第${a.col + 1}列和第${b.col + 1}列都只可能出现在第${a.rows[0] + 1}/${a.rows[1] + 1}行，所以这两行其他列可删 ${digit}。`,
+          basisCells: [a.rows[0] * 9 + a.col, a.rows[1] * 9 + a.col, b.rows[0] * 9 + b.col, b.rows[1] * 9 + b.col],
+        }, steps) || changed;
+      }
+    }
+    return changed;
+  }
+
+  function applyElimination(candidates, targets, digits, meta, steps) {
+    const uniqueTargets = [...new Set(targets)];
+    const uniqueRemove = uniqueDigits(digits);
+    const changes = [];
+
+    for (const index of uniqueTargets) {
+      if (!candidates[index] || !candidates[index].length) continue;
+      const removed = candidates[index].filter((digit) => uniqueRemove.includes(digit));
+      if (!removed.length) continue;
+
+      candidates[index] = candidates[index].filter((digit) => !uniqueRemove.includes(digit));
+      changes.push({ index, removed });
+    }
+
+    if (!changes.length) return false;
+
+    steps.push({
+      technique: meta.technique,
+      reason: meta.reason,
+      basisCells: meta.basisCells || [],
+      changes,
+    });
+    return true;
+  }
+
+  function combinations(items, size) {
+    const result = [];
+    const combo = [];
+
+    function walk(start) {
+      if (combo.length === size) {
+        result.push(combo.slice());
+        return;
+      }
+      for (let i = start; i <= items.length - (size - combo.length); i += 1) {
+        combo.push(items[i]);
+        walk(i + 1);
+        combo.pop();
+      }
+    }
+
+    walk(0);
+    return result;
+  }
+
+  function uniqueDigits(values) {
+    return [...new Set(values)].filter((digit) => DIGITS.includes(digit)).sort((a, b) => a - b);
+  }
+
+  function sameMembers(a, b) {
+    if (a.length !== b.length) return false;
+    const left = a.slice().sort((x, y) => x - y);
+    const right = b.slice().sort((x, y) => x - y);
+    return left.every((value, index) => value === right[index]);
+  }
+
+  function subsetName(size) {
+    if (size === 2) return "对";
+    if (size === 3) return "三";
+    return "四";
+  }
+
+  function rowCells(row) {
+    return DIGITS.map((_, col) => row * 9 + col);
+  }
+
+  function colCells(col) {
+    return DIGITS.map((_, row) => row * 9 + col);
+  }
+
+  function boxIndex(index) {
+    const { row, col } = rowCol(index);
+    return Math.floor(row / 3) * 3 + Math.floor(col / 3);
+  }
+
+  function digitList(digits) {
+    return uniqueDigits(digits).join("/");
+  }
+
+  function cellList(cells) {
+    return cells.map((index) => {
+      const { row, col } = rowCol(index);
+      return `R${row + 1}C${col + 1}`;
+    }).join("、");
   }
 
   function findConflicts(grid) {
@@ -1510,9 +1795,10 @@
 
     const strongCount = result.strongHints.length;
     const conflictCount = result.conflicts.size;
+    const logicCount = result.logicSteps ? result.logicSteps.length : 0;
     const summaryLines = [
       `已填 ${result.filled} 格，空 ${result.empty} 格`,
-      `确定提示 ${strongCount} 个${conflictCount ? `，冲突 ${conflictCount} 格` : ""}`,
+      `确定提示 ${strongCount} 个，推理删候选 ${logicCount} 步${conflictCount ? `，冲突 ${conflictCount} 格` : ""}`,
       state.strongOnly ? "当前只显示强提示。" : "当前显示候选数和强提示。",
     ];
     if (state.notice) summaryLines.push(state.notice);
@@ -1527,7 +1813,39 @@
       rows.push(`<li><span>还有 ${result.strongHints.length - 18} 个</span><span class="${APP_ID}-muted">滚动查看棋盘</span></li>`);
     }
 
+    const logicRows = (result.logicSteps || []).slice(0, 14).map(formatLogicStep);
+    if (logicRows.length) {
+      rows.push(`<li><span><strong>推理思路</strong></span><span class="${APP_ID}-muted">候选删减</span></li>`);
+      rows.push(...logicRows);
+      if (result.logicSteps.length > logicRows.length) {
+        rows.push(`<li><span>还有 ${result.logicSteps.length - logicRows.length} 步推理</span><span class="${APP_ID}-muted">已省略</span></li>`);
+      }
+    }
+
     state.list.innerHTML = rows.length ? rows.join("") : `<li><span>暂无确定单</span><span class="${APP_ID}-muted">看小候选数继续推理</span></li>`;
+  }
+
+  function formatLogicStep(step) {
+    const changes = step.changes || [];
+    const shown = changes.slice(0, 4).map((change) => `${cellList([change.index])}删${digitList(change.removed)}`);
+    if (changes.length > shown.length) shown.push(`等${changes.length}处`);
+
+    return [
+      `<li data-kind="logic">`,
+      `<span><strong>${escapeHtml(step.technique || "推理")}</strong>：${escapeHtml(step.reason || "")}</span>`,
+      `<span class="${APP_ID}-reason">${escapeHtml(shown.join("，"))}</span>`,
+      `</li>`,
+    ].join("");
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (char) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;",
+    }[char]));
   }
 
   function rowCol(index) {
