@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.7.4
+// @version      0.7.5
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.7.4";
+  const SCRIPT_VERSION = "0.7.5";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -303,6 +303,12 @@
         refresh(true);
       },
       getLastResult: () => state.lastResult,
+      getCurrentSource: () => state.lastGoodSource ? {
+        grid: state.lastGoodSource.grid.slice(),
+        source: state.lastGoodSource.source,
+        detail: state.lastGoodSource.detail,
+        rememberedAt: state.lastGoodSource.rememberedAt,
+      } : null,
       getCapturedGames: () => state.networkCandidates.slice(),
       autoFill: () => autoFillStrongHints(),
       stopAutoFill: () => requestAutoFillStop(),
@@ -591,7 +597,11 @@
     if (Date.now() - state.boardRescanStartedAt <= BOARD_RESCAN_STALE_MS) return true;
 
     state.boardRescanStartedAt = 0;
-    if (!state.awaitingFreshBoard) state.staleGridSignatures.clear();
+    if (!state.awaitingFreshBoard) {
+      state.staleGridSignatures.clear();
+      state.expectedDifficulty = "";
+      state.expectedMode = "";
+    }
     return false;
   }
 
@@ -631,6 +641,8 @@
 
     state.awaitingFreshBoard = false;
     state.staleGridSignatures.clear();
+    state.expectedDifficulty = "";
+    state.expectedMode = "";
     state.boardRescanStartedAt = 0;
     clearBoardRescanTimers();
   }
@@ -642,8 +654,10 @@
   function refresh(force) {
     if (window.location.href !== state.lastLocationHref) {
       state.lastLocationHref = window.location.href;
-      scheduleBoardRescan("检测到页面地址变化，正在读取新盘面...", { markStale: true });
-      return;
+      if (!state.awaitingFreshBoard && !state.staleGridSignatures.size) {
+        scheduleBoardRescan("检测到页面地址变化，正在读取新盘面...", { markStale: true });
+        return;
+      }
     }
 
     const board = findBoardElement();
@@ -1094,12 +1108,7 @@
       if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
 
       const runtime = readWebpackGame();
-      if (
-        runtime &&
-        runtime.grid &&
-        shouldUseCurrentGrid(runtime.grid) &&
-        (!state.staleGridSignatures.size || hasFreshActiveBase())
-      ) return runtime;
+      if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
     } else {
       const stored = readStoredGame();
       if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
@@ -1709,12 +1718,21 @@
   function readWebpackGame(options = {}) {
     const webpackRequire = getWebpackRequire();
     const moduleCache = webpackRequire && webpackRequire.c;
-    if (!moduleCache || typeof moduleCache !== "object") return null;
+    const moduleFactories = webpackRequire && webpackRequire.m;
+    if (
+      (!moduleCache || typeof moduleCache !== "object") &&
+      (!moduleFactories || typeof moduleFactories !== "object")
+    ) return null;
 
     const candidates = [];
-    for (const [moduleId, moduleRecord] of Object.entries(moduleCache)) {
-      collectRuntimeCandidates(moduleRecord && moduleRecord.exports, `webpack:${moduleId}.exports`, candidates);
-      if (candidates.length > 20) break;
+    if (moduleCache && typeof moduleCache === "object") {
+      for (const [moduleId, moduleRecord] of Object.entries(moduleCache)) {
+        collectRuntimeCandidates(moduleRecord && moduleRecord.exports, `webpack:${moduleId}.exports`, candidates);
+        if (candidates.length > 20) break;
+      }
+    }
+    if (moduleFactories && typeof moduleFactories === "object" && candidates.length < 20) {
+      collectRuntimeModuleFactoryCandidates(webpackRequire, moduleFactories, candidates);
     }
 
     const ranked = candidates
@@ -1736,19 +1754,89 @@
   function getWebpackRequire() {
     if (state.webpackRequire) return state.webpackRequire;
 
-    const chunk = window.webpackChunk || (typeof self !== "undefined" && self.webpackChunk);
-    if (!Array.isArray(chunk) || typeof chunk.push !== "function") return null;
-
-    try {
-      const chunkId = `${APP_ID}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      chunk.push([[chunkId], {}, (webpackRequire) => {
-        state.webpackRequire = webpackRequire;
-      }]);
-    } catch (error) {
-      return null;
+    for (const chunk of getRuntimeChunks()) {
+      try {
+        const chunkId = `${APP_ID}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        let capturedRequire = null;
+        chunk.push([[chunkId], {}, (webpackRequire) => {
+          capturedRequire = webpackRequire;
+        }]);
+        if (capturedRequire && (capturedRequire.c || capturedRequire.m)) {
+          state.webpackRequire = capturedRequire;
+          return state.webpackRequire;
+        }
+      } catch (error) {
+        // Try the next runtime chunk name.
+      }
     }
 
-    return state.webpackRequire || null;
+    return null;
+  }
+
+  function getRuntimeChunks() {
+    const roots = [window];
+    if (typeof self !== "undefined" && self !== window) roots.push(self);
+
+    const chunks = [];
+    const seen = new Set();
+    for (const root of roots) {
+      for (const name of ["webpackChunk", "rspbjsChunk"]) {
+        const chunk = root && root[name];
+        if (Array.isArray(chunk) && typeof chunk.push === "function" && !seen.has(chunk)) {
+          seen.add(chunk);
+          chunks.push(chunk);
+        }
+      }
+    }
+    return chunks;
+  }
+
+  function collectRuntimeModuleFactoryCandidates(webpackRequire, moduleFactories, candidates) {
+    const moduleIds = Object.entries(moduleFactories)
+      .map(([moduleId, factory]) => ({
+        moduleId,
+        source: factoryToText(factory),
+      }))
+      .filter((item) => isLikelyGameRuntimeModule(item.source))
+      .sort((a, b) => scoreRuntimeModuleSource(b.source) - scoreRuntimeModuleSource(a.source))
+      .slice(0, 80)
+      .map((item) => item.moduleId);
+
+    for (const moduleId of moduleIds) {
+      try {
+        const exports = webpackRequire(moduleId);
+        collectRuntimeCandidates(exports, `webpack:${moduleId}.module`, candidates);
+      } catch (error) {
+        // Some module factories have side-effect-only prerequisites; skip them.
+      }
+      if (candidates.length > 30) break;
+    }
+  }
+
+  function factoryToText(factory) {
+    try {
+      return Function.prototype.toString.call(factory);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function isLikelyGameRuntimeModule(source) {
+    return (
+      /currentGame/.test(source) &&
+      /values|mission/.test(source) &&
+      /MAIN_GAME|main_game|prepareBoard|setDifficulty|setMode/.test(source)
+    );
+  }
+
+  function scoreRuntimeModuleSource(source) {
+    let score = 0;
+    if (/currentGame/.test(source)) score += 30;
+    if (/MAIN_GAME|main_game/.test(source)) score += 25;
+    if (/prepareBoard/.test(source)) score += 20;
+    if (/setDifficulty|setMode/.test(source)) score += 10;
+    if (/hideLoadGameDialog|showSavedPopup/.test(source)) score += 5;
+    return score;
   }
 
   function collectRuntimeCandidates(root, path, candidates) {
@@ -2075,12 +2163,16 @@
       return { name: store.name, count: keys.length, relevant };
     });
     const webpackRequire = getWebpackRequire();
-    const webpackCount = webpackRequire && webpackRequire.c ? Object.keys(webpackRequire.c).length : 0;
+    const webpackCacheCount = webpackRequire && webpackRequire.c ? Object.keys(webpackRequire.c).length : 0;
+    const webpackFactoryCount = webpackRequire && webpackRequire.m ? Object.keys(webpackRequire.m).length : 0;
+    const webpackCount = webpackCacheCount || webpackFactoryCount;
     const boardFound = Boolean(findBoardElement());
     scanPageScriptsForGames();
     const info = {
       boardFound,
       webpackModules: webpackCount,
+      webpackCacheModules: webpackCacheCount,
+      webpackFactoryModules: webpackFactoryCount,
       capturedNetworkGames: state.networkCandidates.length,
       capturedPageGames: state.pageCandidates.length,
       storage: storageInfo,
