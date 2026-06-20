@@ -12,7 +12,7 @@
 
 Tampermonkey 自动更新地址：
 
-- 安装/下载：`https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js`
+- 安装/下载：`https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1`
 - 脚本头里已经配置了 `@updateURL` 和 `@downloadURL`。
 
 提示规则：
