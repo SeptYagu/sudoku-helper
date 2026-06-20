@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.2.1
+// @version      0.3.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
 // @downloadURL  https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -51,7 +51,11 @@
     lastResult: null,
     lastDiagnostics: null,
     webpackRequire: null,
+    networkCandidates: [],
+    networkHookInstalled: false,
   };
+
+  installNetworkHooks();
 
   const css = `
     #${APP_ID}-overlay {
@@ -197,6 +201,7 @@
         refresh(true);
       },
       getLastResult: () => state.lastResult,
+      getCapturedGames: () => state.networkCandidates.slice(),
       diagnose: () => diagnose(true),
     };
   }
@@ -411,16 +416,140 @@
     const stored = readStoredGame();
     if (stored && stored.grid) return stored;
 
+    const network = readNetworkGame();
+    if (network && network.grid) return network;
+
     const diagnostics = diagnose(false);
     return {
       grid: null,
       source: "未读取到盘面",
       detail: [
         "没有从运行时或本地存储读到当前盘面。",
-        "请先等棋盘加载完成，或在网页上点任意格/填一个数后再点“刷新”。",
+        "请先等棋盘加载完成；新版会自动监听题目接口，不需要先填数字。",
         "也可以打开“手动盘面”粘贴 81 位盘面。",
         diagnostics && diagnostics.short ? `诊断: ${diagnostics.short}` : "",
       ].filter(Boolean).join("\n"),
+    };
+  }
+
+  function installNetworkHooks() {
+    if (state.networkHookInstalled) return;
+    state.networkHookInstalled = true;
+
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === "function") {
+      window.fetch = function sudokuHelperFetchHook(...args) {
+        const url = getRequestUrl(args[0]);
+        return originalFetch.apply(this, args).then((response) => {
+          captureFetchResponse(response, url);
+          return response;
+        });
+      };
+    }
+
+    const XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      const originalOpen = XHR.prototype.open;
+      const originalSend = XHR.prototype.send;
+      if (typeof originalOpen === "function" && typeof originalSend === "function") {
+        XHR.prototype.open = function sudokuHelperOpenHook(method, url, ...rest) {
+          this.__sudokuHelperUrl = getRequestUrl(url);
+          return originalOpen.call(this, method, url, ...rest);
+        };
+        XHR.prototype.send = function sudokuHelperSendHook(...args) {
+          try {
+            this.addEventListener("loadend", () => {
+              if (typeof this.responseText === "string") {
+                recordResponseText(this.responseText, this.__sudokuHelperUrl || "xhr");
+              }
+            });
+          } catch (error) {
+            // Ignore XHRs that do not allow listeners.
+          }
+          return originalSend.apply(this, args);
+        };
+      }
+    }
+  }
+
+  function getRequestUrl(request) {
+    if (!request) return "unknown";
+    if (typeof request === "string") return request;
+    if (request.url) return String(request.url);
+    return String(request);
+  }
+
+  function captureFetchResponse(response, url) {
+    if (!response || typeof response.clone !== "function") return;
+    const contentType = response.headers && response.headers.get && response.headers.get("content-type");
+    if (contentType && !/json|text|javascript/i.test(contentType)) return;
+
+    try {
+      response.clone().text().then((text) => {
+        recordResponseText(text, url || response.url || "fetch");
+      }).catch(() => {});
+    } catch (error) {
+      // Some opaque responses cannot be cloned/read.
+    }
+  }
+
+  function recordResponseText(text, source) {
+    if (!text || typeof text !== "string" || text.length > 2_000_000) return;
+    const trimmed = text.trim();
+    if (!trimmed || !"[{".includes(trimmed[0])) return;
+
+    try {
+      recordGamePayload(JSON.parse(trimmed), source || "network");
+    } catch (error) {
+      // Non-JSON responses are ignored.
+    }
+  }
+
+  function recordGamePayload(payload, source) {
+    const candidates = [];
+    collectGameCandidates(payload, `network:${source}`, candidates);
+    collectLegacyPayloadCandidates(payload, `network:${source}`, candidates);
+
+    let added = false;
+    const capturedAt = Date.now();
+    for (const candidate of candidates) {
+      const grid = gameToGrid(candidate.game);
+      if (!grid) continue;
+      state.networkCandidates.unshift({ ...candidate, grid, capturedAt });
+      added = true;
+    }
+
+    if (!added) return;
+
+    const seen = new Set();
+    state.networkCandidates = state.networkCandidates.filter((candidate) => {
+      const key = `${candidate.grid.join("")}|${candidate.path}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 30);
+
+    if (state.panel) {
+      window.requestAnimationFrame(() => refresh(true));
+    }
+  }
+
+  function readNetworkGame() {
+    if (!state.networkCandidates.length) return null;
+
+    const ranked = state.networkCandidates
+      .map((item) => ({
+        ...item,
+        score: scoreCandidate(item) + Math.max(0, 20 - Math.floor((Date.now() - item.capturedAt) / 30_000)),
+      }))
+      .sort((a, b) => b.score - a.score);
+    const best = ranked[0];
+    if (!best) return null;
+
+    return {
+      grid: best.grid,
+      source: best.path,
+      detail: best.game.id ? `题目 ID: ${best.game.id}` : "自动抓取 sudoku.com 题目接口",
     };
   }
 
@@ -574,6 +703,59 @@
     };
   }
 
+  function collectLegacyPayloadCandidates(root, path, candidates) {
+    const seen = new WeakSet();
+
+    function walk(value, currentPath, depth) {
+      if (!value || typeof value !== "object" || depth > 7) return;
+      if (seen.has(value)) return;
+      seen.add(value);
+
+      const game = legacyPayloadToGame(value);
+      if (game) {
+        candidates.push({ game, path: `${currentPath}.legacyPayload` });
+        return;
+      }
+
+      if (Array.isArray(value)) {
+        const limit = Math.min(value.length, 80);
+        for (let i = 0; i < limit; i += 1) walk(value[i], `${currentPath}[${i}]`, depth + 1);
+        return;
+      }
+
+      const entries = Object.entries(value).slice(0, 100);
+      for (const [key, child] of entries) walk(child, `${currentPath}.${key}`, depth + 1);
+    }
+
+    walk(root, path, 0);
+  }
+
+  function legacyPayloadToGame(value) {
+    if (!value || typeof value !== "object" || !value.clearGrid || !value.solvedGrid) return null;
+
+    const mission = Array.isArray(value.clearGrid) ? value.clearGrid.join("") : String(value.clearGrid);
+    const solution = Array.isArray(value.solvedGrid) ? value.solvedGrid.join("") : String(value.solvedGrid);
+    const base = normalizeGridString(mission);
+    if (!base || !normalizeGridString(solution)) return null;
+
+    const userGrid = value.userGrid || [];
+    const userText = Array.isArray(userGrid) ? "" : String(userGrid);
+    const values = base.map((digit, index) => {
+      const entered = Array.isArray(userGrid) ? normalizeDigit(userGrid[index]) : normalizeDigit(userText[index]);
+      return digit || entered || 0;
+    });
+
+    return {
+      values,
+      mission: base.join(""),
+      solution,
+      loaded: true,
+      mode: value.mode || "classic",
+      difficulty: value.difficulty || "",
+      id: value.id,
+    };
+  }
+
   function getStorageObjects() {
     const stores = [];
     try {
@@ -720,8 +902,9 @@
     const info = {
       boardFound,
       webpackModules: webpackCount,
+      capturedNetworkGames: state.networkCandidates.length,
       storage: storageInfo,
-      short: `board=${boardFound}, webpackModules=${webpackCount}, keys=${storageInfo.map((item) => `${item.name}:${item.relevant.join(",") || "-"}`).join(" | ")}`,
+      short: `board=${boardFound}, webpackModules=${webpackCount}, network=${state.networkCandidates.length}, keys=${storageInfo.map((item) => `${item.name}:${item.relevant.join(",") || "-"}`).join(" | ")}`,
     };
     state.lastDiagnostics = info;
 

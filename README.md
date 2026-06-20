@@ -10,6 +10,12 @@
 2. 直接把 `sudoku-helper.user.js` 的全部内容粘到浏览器控制台执行，或装到 Tampermonkey 作为 Userscript。
 3. 页面右下角会出现“数独候选助手”面板，棋盘上会叠加候选数。
 
+自动读取逻辑：
+
+- 新版脚本会在 `document-start` 监听 sudoku.com 的题目接口，页面刚加载出棋盘时就能抓到题面。
+- 如果你已经填过数字，会优先读取页面运行状态或存档里的当前盘面。
+- 不需要先随便填一个数字来触发 localStorage。
+
 Tampermonkey 自动更新地址：
 
 - 安装/下载：`https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1`
