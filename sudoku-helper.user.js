@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudoku.com Candidate Helper
 // @namespace    local.sudoku-helper
-// @version      0.6.9
+// @version      0.7.0
 // @description  Show legal candidates and strong single hints on sudoku.com.
 // @match        https://sudoku.com/*
 // @updateURL    https://raw.githubusercontent.com/SeptYagu/sudoku-helper/main/sudoku-helper.user.js?raw=1
@@ -15,7 +15,7 @@
 
   const APP_ID = "sudoku-candidate-helper";
   const API_NAME = "SudokuCandidateHelper";
-  const SCRIPT_VERSION = "0.6.9";
+  const SCRIPT_VERSION = "0.7.0";
   const STORAGE_KEYS = [
     "main_game",
     "main_game_killer",
@@ -29,6 +29,8 @@
   const LEGACY_KEYS = ["clearGrid", "userGrid", "puzzleGrid", "pencilGrid", "winRate", "timePassed", "cages"];
   const DIGITS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
   const SPEED_STORAGE_KEY = `${APP_ID}:autoFillSpeed`;
+  const HOOK_STATE_KEY = `${APP_ID}:networkHooks`;
+  const ACTIVE_BASE_MAX_AGE_MS = 5 * 60 * 1000;
 
   if (window[API_NAME] && typeof window[API_NAME].destroy === "function") {
     window[API_NAME].destroy();
@@ -70,6 +72,7 @@
     activeBaseCapturedAt: 0,
     lastLocationHref: window.location.href,
     networkHookInstalled: false,
+    networkHookState: null,
   };
 
   installNetworkHooks();
@@ -958,22 +961,22 @@
     }
 
     const runtime = readWebpackGame();
-    if (runtime && runtime.grid) return runtime;
-
-    const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
-    if (freshNetwork && freshNetwork.grid) return freshNetwork;
+    if (runtime && runtime.grid && shouldUseCurrentGrid(runtime.grid)) return runtime;
 
     const stored = readStoredGame();
-    if (stored && stored.grid && shouldUseStoredGrid(stored.grid)) return stored;
+    if (stored && stored.grid && shouldUseCurrentGrid(stored.grid)) return stored;
+
+    const freshNetwork = readNetworkGame({ maxAgeMs: 20_000 });
+    if (freshNetwork && freshNetwork.grid && shouldUseCurrentGrid(freshNetwork.grid)) return freshNetwork;
 
     const network = readNetworkGame();
-    if (network && network.grid) return network;
+    if (network && network.grid && shouldUseCurrentGrid(network.grid)) return network;
 
     const pageScript = readPageScriptGame();
-    if (pageScript && pageScript.grid) return pageScript;
+    if (pageScript && pageScript.grid && shouldUseCurrentGrid(pageScript.grid)) return pageScript;
 
     const lastGood = readLastGoodGame();
-    if (lastGood && lastGood.grid) return lastGood;
+    if (lastGood && lastGood.grid && shouldUseCurrentGrid(lastGood.grid)) return lastGood;
 
     const diagnostics = diagnose(false);
     return {
@@ -1013,37 +1016,61 @@
 
   function installNetworkHooks() {
     if (state.networkHookInstalled) return;
+    const hookState = getNetworkHookState();
     state.networkHookInstalled = true;
+    state.networkHookState = hookState;
 
-    const originalFetch = window.fetch;
-    if (typeof originalFetch === "function") {
-      window.fetch = function sudokuHelperFetchHook(...args) {
+    hookState.recordResponseText = recordResponseText;
+    hookState.recordGamePayload = recordGamePayload;
+
+    if (!hookState.fetchWrapper) {
+      hookState.fetchWrapper = function sudokuHelperFetchHook(...args) {
         const url = getRequestUrl(args[0]);
-        return originalFetch.apply(this, args).then((response) => {
-          captureFetchResponse(response, url);
+        return hookState.originalFetch.apply(this, args).then((response) => {
+          captureFetchResponse(response, url, hookState.recordResponseText);
           return response;
         });
       };
     }
 
+    if (typeof window.fetch === "function" && !hookState.originalFetch) {
+      hookState.originalFetch = window.fetch;
+    }
+    if (typeof hookState.originalFetch === "function" && window.fetch === hookState.originalFetch) {
+      window.fetch = hookState.fetchWrapper;
+    }
+
     const XHR = window.XMLHttpRequest;
     if (XHR && XHR.prototype) {
-      const originalOpen = XHR.prototype.open;
-      const originalSend = XHR.prototype.send;
-      if (typeof originalOpen === "function" && typeof originalSend === "function") {
-        XHR.prototype.open = function sudokuHelperOpenHook(method, url, ...rest) {
+      if (typeof XHR.prototype.open === "function" && !hookState.originalXhrOpen) {
+        hookState.originalXhrOpen = XHR.prototype.open;
+      }
+      if (typeof XHR.prototype.send === "function" && !hookState.originalXhrSend) {
+        hookState.originalXhrSend = XHR.prototype.send;
+      }
+
+      if (!hookState.xhrOpenWrapper) {
+        hookState.xhrOpenWrapper = function sudokuHelperOpenHook(method, url, ...rest) {
           this.__sudokuHelperUrl = getRequestUrl(url);
-          return originalOpen.call(this, method, url, ...rest);
+          return hookState.originalXhrOpen.call(this, method, url, ...rest);
         };
-        XHR.prototype.send = function sudokuHelperSendHook(...args) {
+      }
+      if (!hookState.xhrSendWrapper) {
+        hookState.xhrSendWrapper = function sudokuHelperSendHook(...args) {
           try {
             this.addEventListener("loadend", () => {
               try {
+                const recordPayload = hookState.recordGamePayload;
+                const recordText = hookState.recordResponseText;
                 if (this.response && typeof this.response === "object") {
-                  recordGamePayload(this.response, this.__sudokuHelperUrl || "xhr.response");
+                  if (typeof recordPayload === "function") {
+                    recordPayload(this.response, this.__sudokuHelperUrl || "xhr.response");
+                  }
                 }
                 if (typeof this.responseText === "string") {
-                  recordResponseText(this.responseText, this.__sudokuHelperUrl || "xhr");
+                  if (typeof recordText === "function") {
+                    recordText(this.responseText, this.__sudokuHelperUrl || "xhr");
+                  }
                 }
               } catch (error) {
                 // Some responseType values disallow responseText.
@@ -1052,8 +1079,79 @@
           } catch (error) {
             // Ignore XHRs that do not allow listeners.
           }
-          return originalSend.apply(this, args);
+          return hookState.originalXhrSend.apply(this, args);
         };
+      }
+
+      if (typeof hookState.originalXhrOpen === "function" && XHR.prototype.open === hookState.originalXhrOpen) {
+        XHR.prototype.open = hookState.xhrOpenWrapper;
+      }
+      if (typeof hookState.originalXhrSend === "function" && XHR.prototype.send === hookState.originalXhrSend) {
+        XHR.prototype.send = hookState.xhrSendWrapper;
+      }
+    }
+  }
+
+  function getNetworkHookState() {
+    const existing = window[HOOK_STATE_KEY];
+    if (existing && existing.version === 1) return existing;
+
+    const XHR = window.XMLHttpRequest;
+    const hookState = {
+      version: 1,
+      originalFetch: window.fetch,
+      originalXhrOpen: XHR && XHR.prototype ? XHR.prototype.open : null,
+      originalXhrSend: XHR && XHR.prototype ? XHR.prototype.send : null,
+      fetchWrapper: null,
+      xhrOpenWrapper: null,
+      xhrSendWrapper: null,
+      recordResponseText: null,
+      recordGamePayload: null,
+    };
+
+    try {
+      Object.defineProperty(window, HOOK_STATE_KEY, {
+        value: hookState,
+        configurable: true,
+      });
+    } catch (error) {
+      window[HOOK_STATE_KEY] = hookState;
+    }
+    return hookState;
+  }
+
+  function restoreNetworkHooks() {
+    const hookState = state.networkHookState || window[HOOK_STATE_KEY];
+    if (!hookState) return;
+
+    hookState.recordResponseText = null;
+    hookState.recordGamePayload = null;
+
+    if (hookState.fetchWrapper && window.fetch === hookState.fetchWrapper && typeof hookState.originalFetch === "function") {
+      window.fetch = hookState.originalFetch;
+    }
+
+    const XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      if (hookState.xhrOpenWrapper && XHR.prototype.open === hookState.xhrOpenWrapper && typeof hookState.originalXhrOpen === "function") {
+        XHR.prototype.open = hookState.originalXhrOpen;
+      }
+      if (hookState.xhrSendWrapper && XHR.prototype.send === hookState.xhrSendWrapper && typeof hookState.originalXhrSend === "function") {
+        XHR.prototype.send = hookState.originalXhrSend;
+      }
+    }
+
+    state.networkHookInstalled = false;
+    state.networkHookState = null;
+
+    const fetchRestored = !hookState.fetchWrapper || window.fetch !== hookState.fetchWrapper;
+    const xhrOpenRestored = !XHR || !XHR.prototype || !hookState.xhrOpenWrapper || XHR.prototype.open !== hookState.xhrOpenWrapper;
+    const xhrSendRestored = !XHR || !XHR.prototype || !hookState.xhrSendWrapper || XHR.prototype.send !== hookState.xhrSendWrapper;
+    if (window[HOOK_STATE_KEY] === hookState && fetchRestored && xhrOpenRestored && xhrSendRestored) {
+      try {
+        delete window[HOOK_STATE_KEY];
+      } catch (error) {
+        window[HOOK_STATE_KEY] = null;
       }
     }
   }
@@ -1065,14 +1163,14 @@
     return String(request);
   }
 
-  function captureFetchResponse(response, url) {
+  function captureFetchResponse(response, url, recorder = recordResponseText) {
     if (!response || typeof response.clone !== "function") return;
     const contentType = response.headers && response.headers.get && response.headers.get("content-type");
     if (contentType && !/json|text|javascript/i.test(contentType)) return;
 
     try {
       response.clone().text().then((text) => {
-        recordResponseText(text, url || response.url || "fetch");
+        if (typeof recorder === "function") recorder(text, url || response.url || "fetch");
       }).catch(() => {});
     } catch (error) {
       // Some opaque responses cannot be cloned/read.
@@ -1115,12 +1213,22 @@
       .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))[0];
     const latestSignature = bestCaptured?.grid.join("");
     if (latestSignature) {
-      state.activeBaseGrid = normalizeGridString(bestCaptured.game.mission) || bestCaptured.grid.slice();
+      const nextBaseGrid = getBaseGridForGame(bestCaptured.game, bestCaptured.grid);
+      const previousBaseSignature = state.activeBaseGrid ? state.activeBaseGrid.join("") : "";
+      const nextBaseSignature = nextBaseGrid ? nextBaseGrid.join("") : "";
+
+      if (previousBaseSignature && nextBaseSignature && previousBaseSignature !== nextBaseSignature) {
+        state.lastGoodSource = null;
+      }
+
+      state.activeBaseGrid = nextBaseGrid;
       state.activeBaseCapturedAt = capturedAt;
       state.networkCandidates = state.networkCandidates.filter((candidate) => (
         candidate.grid.join("") === latestSignature || capturedAt - candidate.capturedAt < 2500
       ));
-      state.pageCandidates = state.pageCandidates.filter((candidate) => candidate.grid.join("") === latestSignature);
+      state.pageCandidates = state.pageCandidates.filter((candidate) => (
+        !nextBaseGrid || gridMatchesBaseGrid(candidate.grid, nextBaseGrid)
+      ));
       state.pageScanSignature = "";
       state.lastSignature = "";
     }
@@ -1145,6 +1253,7 @@
 
     const ranked = state.networkCandidates
       .filter((item) => !maxAgeMs || now - item.capturedAt <= maxAgeMs)
+      .filter((item) => shouldUseCurrentGrid(item.grid))
       .map((item) => ({
         ...item,
         score: scoreCandidate(item) + Math.max(0, 20 - Math.floor((now - item.capturedAt) / 30_000)),
@@ -1160,8 +1269,32 @@
     };
   }
 
-  function shouldUseStoredGrid(grid) {
-    return Array.isArray(grid) && grid.length === 81;
+  function shouldUseCurrentGrid(grid) {
+    if (!Array.isArray(grid) || grid.length !== 81) return false;
+    if (!hasFreshActiveBase()) return true;
+    return gridMatchesBaseGrid(grid, state.activeBaseGrid);
+  }
+
+  function getBaseGridForGame(game, fallbackGrid) {
+    return normalizeGridString(game && game.mission) || (Array.isArray(fallbackGrid) ? fallbackGrid.slice() : null);
+  }
+
+  function hasFreshActiveBase() {
+    return (
+      Array.isArray(state.activeBaseGrid) &&
+      state.activeBaseGrid.length === 81 &&
+      Date.now() - state.activeBaseCapturedAt <= ACTIVE_BASE_MAX_AGE_MS
+    );
+  }
+
+  function gridMatchesBaseGrid(grid, baseGrid) {
+    if (!Array.isArray(grid) || !Array.isArray(baseGrid)) return false;
+    if (grid.length !== 81 || baseGrid.length !== 81) return false;
+
+    for (let index = 0; index < 81; index += 1) {
+      if (baseGrid[index] && grid[index] !== baseGrid[index]) return false;
+    }
+    return true;
   }
 
   function readPageScriptGame() {
@@ -1169,6 +1302,7 @@
     if (!state.pageCandidates.length) return null;
 
     const ranked = state.pageCandidates
+      .filter((item) => shouldUseCurrentGrid(item.grid))
       .map((item) => ({ ...item, score: scoreCandidate(item) + 15 }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
@@ -1308,16 +1442,15 @@
     }
 
     const ranked = candidates
+      .map((item) => ({ ...item, grid: gameToGrid(item.game) }))
+      .filter((item) => item.grid && shouldUseCurrentGrid(item.grid))
       .map((item) => ({ ...item, score: scoreCandidate(item) + (item.path.includes(".state.currentGame") ? 60 : 30) }))
       .sort((a, b) => b.score - a.score);
     const best = ranked[0];
     if (!best) return null;
 
-    const grid = gameToGrid(best.game);
-    if (!grid) return null;
-
     return {
-      grid,
+      grid: best.grid,
       source: best.path,
       detail: best.game.id ? `题目 ID: ${best.game.id}` : "自动读取当前页面运行中的棋盘",
     };
@@ -1400,17 +1533,16 @@
     }
 
     const ranked = candidates
+      .map((item) => ({ ...item, grid: gameToGrid(item.game) }))
+      .filter((item) => item.grid && shouldUseCurrentGrid(item.grid))
       .map((item) => ({ ...item, score: scoreCandidate(item) }))
       .sort((a, b) => b.score - a.score);
 
     const best = ranked[0];
     if (!best) return null;
 
-    const grid = gameToGrid(best.game);
-    if (!grid) return null;
-
     return {
-      grid,
+      grid: best.grid,
       source: best.path,
       detail: best.game.id ? `题目 ID: ${best.game.id}` : "自动读取 sudoku.com 当前存档",
     };
@@ -2227,6 +2359,7 @@
     clearNoGridRetry();
     window.removeEventListener("resize", scheduleRefresh);
     window.removeEventListener("scroll", scheduleRefresh);
+    restoreNetworkHooks();
     if (state.overlay) state.overlay.remove();
     if (state.panel) state.panel.remove();
     const style = document.getElementById(`${APP_ID}-style`);
